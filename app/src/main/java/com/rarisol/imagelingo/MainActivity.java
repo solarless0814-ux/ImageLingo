@@ -63,6 +63,7 @@ public final class MainActivity extends Activity {
     private final Map<String, TranslationClient.TranslationResult> translationCache = new HashMap<>();
 
     private ZoomImageView imageView;
+    private TranslationOverlayView overlayView;
     private TextView titleView;
     private TextView subtitleView;
     private ProgressBar progressBar;
@@ -71,6 +72,7 @@ public final class MainActivity extends Activity {
     private TextView translationText;
     private TextView tokenBadge;
     private Button translateButton;
+    private Button overlayToggleButton;
     private TextView vertexStatusText;
 
     private List<ImageRepository.ImageEntry> images = new ArrayList<>();
@@ -101,14 +103,27 @@ public final class MainActivity extends Activity {
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(COLOR_BG);
 
+        FrameLayout imageStage = new FrameLayout(this);
+        imageStage.setClipChildren(true);
+        imageStage.setClipToPadding(true);
+
         imageView = new ZoomImageView(this);
         imageView.setBackgroundColor(COLOR_BG);
         imageView.setPageSwipeListener(this::movePage);
+        imageStage.addView(imageView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        overlayView = new TranslationOverlayView(this);
+        overlayView.setVisibility(View.GONE);
+        imageStage.addView(overlayView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        imageView.setImageMatrixListener(overlayView::updateImageMatrix);
+
         FrameLayout.LayoutParams imageParams = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
         imageParams.topMargin = dp(76);
         imageParams.bottomMargin = dp(84);
-        root.addView(imageView, imageParams);
+        root.addView(imageStage, imageParams);
 
         LinearLayout topBar = new LinearLayout(this);
         topBar.setOrientation(LinearLayout.HORIZONTAL);
@@ -259,6 +274,18 @@ public final class MainActivity extends Activity {
         tokenParams.setMargins(0, 0, dp(20), dp(94));
         root.addView(tokenBadge, tokenParams);
 
+        overlayToggleButton = makePanelButton("번역 숨기기");
+        overlayToggleButton.setVisibility(View.GONE);
+        overlayToggleButton.setOnClickListener(v -> toggleTranslationOverlay());
+        overlayToggleButton.setOnLongClickListener(v -> {
+            copyTranslation();
+            return true;
+        });
+        FrameLayout.LayoutParams overlayToggleParams = new FrameLayout.LayoutParams(
+                dp(104), dp(38), Gravity.BOTTOM | Gravity.START);
+        overlayToggleParams.setMargins(dp(20), 0, 0, dp(94));
+        root.addView(overlayToggleButton, overlayToggleParams);
+
         progressBar = new ProgressBar(this);
         progressBar.setVisibility(View.GONE);
         FrameLayout.LayoutParams progressParams = new FrameLayout.LayoutParams(dp(54), dp(54), Gravity.CENTER);
@@ -274,6 +301,8 @@ public final class MainActivity extends Activity {
         translationText.setText("상단의 ‘폴더’를 눌러 이미지가 들어 있는 폴더를 선택하세요.\n\n"
                 + "‘설정’에서 Gemini, OpenAI 또는 Vertex AI 인증 정보와 시스템 프롬프트를 입력한 뒤, 하단의 ‘이미지 번역’을 누르면 됩니다.");
         tokenBadge.setVisibility(View.GONE);
+        overlayView.clearBlocks();
+        overlayToggleButton.setVisibility(View.GONE);
         translationPanel.setVisibility(View.VISIBLE);
     }
 
@@ -343,6 +372,8 @@ public final class MainActivity extends Activity {
         subtitleView.setText("");
         translationPanel.setVisibility(View.GONE);
         tokenBadge.setVisibility(View.GONE);
+        overlayView.clearBlocks();
+        overlayToggleButton.setVisibility(View.GONE);
         executor.execute(() -> {
             try {
                 List<ImageRepository.ImageEntry> loaded = ImageRepository.listImages(getContentResolver(), treeUri);
@@ -380,6 +411,8 @@ public final class MainActivity extends Activity {
         subtitleView.setText((currentIndex + 1) + " / " + images.size() + "  ·  " + providerLabel());
         translationPanel.setVisibility(View.GONE);
         tokenBadge.setVisibility(View.GONE);
+        overlayView.clearBlocks();
+        overlayToggleButton.setVisibility(View.GONE);
         progressBar.setVisibility(View.VISIBLE);
         executor.execute(() -> {
             try {
@@ -440,7 +473,7 @@ public final class MainActivity extends Activity {
                 + "|" + apiSettings.openAiEndpoint() + "|" + apiSettings.systemPrompt().hashCode();
         TranslationClient.TranslationResult cached = translationCache.get(cacheKey);
         if (cached != null) {
-            showResult(providerLabel() + " · 캐시", cached.text, false);
+            showTranslationOverlay(cached);
             showTokenUsage(cached.usage, true);
             return;
         }
@@ -449,7 +482,9 @@ public final class MainActivity extends Activity {
         translateButton.setText("번역 중…");
         progressBar.setVisibility(View.VISIBLE);
         tokenBadge.setVisibility(View.GONE);
-        showResult(providerLabel(), "이미지의 글자를 읽고 번역하고 있습니다…", false);
+        translationPanel.setVisibility(View.GONE);
+        overlayView.clearBlocks();
+        overlayToggleButton.setVisibility(View.GONE);
         executor.execute(() -> {
             try {
                 TranslationClient.TranslationResult result = TranslationClient.translate(
@@ -459,7 +494,7 @@ public final class MainActivity extends Activity {
                     translateButton.setEnabled(true);
                     translateButton.setText("이미지 번역");
                     progressBar.setVisibility(View.GONE);
-                    showResult(providerLabel(), result.text, false);
+                    showTranslationOverlay(result);
                     showTokenUsage(result.usage, false);
                 });
             } catch (Exception e) {
@@ -474,10 +509,44 @@ public final class MainActivity extends Activity {
         });
     }
 
+    private void showTranslationOverlay(TranslationClient.TranslationResult result) {
+        translationTitle.setText(providerLabel());
+        translationText.setText(result.text);
+        translationPanel.setVisibility(View.GONE);
+        if (currentBitmap == null || currentBitmap.isRecycled() || result.blocks.isEmpty()) {
+            overlayView.clearBlocks();
+            overlayToggleButton.setVisibility(View.GONE);
+            if (result.blocks.isEmpty()) {
+                Toast.makeText(this, "번역할 외국어 텍스트를 찾지 못했습니다.", Toast.LENGTH_SHORT).show();
+            }
+            return;
+        }
+        overlayView.setSourceSize(currentBitmap.getWidth(), currentBitmap.getHeight());
+        overlayView.updateImageMatrix(imageView.copyImageMatrix());
+        overlayView.setBlocks(result.blocks);
+        overlayView.setVisibility(View.VISIBLE);
+        overlayView.bringToFront();
+        overlayToggleButton.setText("번역 숨기기");
+        overlayToggleButton.setVisibility(View.VISIBLE);
+        overlayToggleButton.bringToFront();
+        tokenBadge.bringToFront();
+    }
+
+    private void toggleTranslationOverlay() {
+        if (!overlayView.hasBlocks()) return;
+        boolean show = overlayView.getVisibility() != View.VISIBLE;
+        overlayView.setVisibility(show ? View.VISIBLE : View.GONE);
+        overlayToggleButton.setText(show ? "번역 숨기기" : "번역 보기");
+    }
+
     private void showResult(String title, String text, boolean error) {
         translationTitle.setText(title);
         translationTitle.setTextColor(error ? 0xFFFFA3A3 : 0xFFBFD5FF);
         translationText.setText(text);
+        if (error) {
+            overlayView.clearBlocks();
+            overlayToggleButton.setVisibility(View.GONE);
+        }
         translationPanel.setVisibility(View.VISIBLE);
     }
 
@@ -594,6 +663,8 @@ public final class MainActivity extends Activity {
                         systemPrompt.getText().toString());
                 translationCache.clear();
                 tokenBadge.setVisibility(View.GONE);
+                overlayView.clearBlocks();
+                overlayToggleButton.setVisibility(View.GONE);
                 if (currentIndex >= 0) {
                     subtitleView.setText((currentIndex + 1) + " / " + images.size() + "  ·  " + providerLabel());
                 }

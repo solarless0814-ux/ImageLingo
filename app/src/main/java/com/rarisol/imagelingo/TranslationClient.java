@@ -25,18 +25,28 @@ import java.security.KeyFactory;
 import java.security.PrivateKey;
 import java.security.Signature;
 import java.security.spec.PKCS8EncodedKeySpec;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 public final class TranslationClient {
     private static final String DEFAULT_SYSTEM_PROMPT =
             "당신은 이미지 번역 전문 번역가입니다. 이미지에 보이는 한국어가 아닌 모든 글자를 자연스러운 한국어로 번역하세요. " +
-            "만화, 게임, 비주얼노벨 대사라면 화자 순서, 말투, 존댓말, 감정, 문맥과 줄바꿈을 최대한 유지하세요. " +
-            "효과음, 작은 글씨, UI 문구도 가능한 한 빠뜨리지 마세요. 설명, 해설, 머리말, 원문 반복 없이 한국어 번역만 출력하세요. " +
-            "번역할 글자가 없으면 [번역할 텍스트 없음]이라고 출력하세요.";
+            "만화, 게임, 비주얼노벨 대사라면 화자 순서, 말투, 존댓말, 감정과 문맥을 최대한 유지하세요. " +
+            "효과음, 작은 글씨, UI 문구도 가능한 한 빠뜨리지 마세요. 고유명사는 문맥에 맞게 일관되게 표기하세요.";
+
+    private static final String STRUCTURED_OUTPUT_INSTRUCTION =
+            "번역 결과는 화면의 원문 위치 위에 표시해야 합니다. 반드시 마크다운 없이 유효한 JSON 객체 하나만 출력하세요. " +
+            "형식은 {\"blocks\":[{\"text\":\"한국어 번역\",\"x\":0,\"y\":0,\"width\":100,\"height\":100}]} 입니다. " +
+            "x, y, width, height는 원본 이미지 전체를 가로·세로 각각 0~1000으로 본 정수 좌표입니다. " +
+            "x,y는 원문 글자 영역의 왼쪽 위이고 width,height는 그 영역의 크기입니다. " +
+            "말풍선이나 문단별로 blocks를 나누고 읽는 순서를 유지하세요. text에는 번역문만 넣고 원문·설명·번호를 넣지 마세요. " +
+            "원문 영역보다 너무 작게 잡지 말고 번역문이 들어갈 정도로 글자 영역 전체를 감싸세요. " +
+            "번역할 외국어가 없으면 {\"blocks\":[]}를 출력하세요.";
 
     private static final String USER_REQUEST =
-            "첨부한 이미지 안의 외국어 문구를 시스템 지시문에 따라 한국어로 번역해 주세요.";
+            "첨부한 이미지 안의 외국어 문구를 찾아 한국어로 번역하고, 각 원문 위치의 좌표와 함께 지정된 JSON 형식으로 반환해 주세요.";
 
     private static final Map<String, CachedToken> TOKEN_CACHE = new HashMap<>();
 
@@ -49,14 +59,15 @@ public final class TranslationClient {
         ImagePayload image = encodeImage(resolver, imageUri);
         String systemPrompt = settings.systemPrompt().trim().isEmpty()
                 ? DEFAULT_SYSTEM_PROMPT : settings.systemPrompt().trim();
+        String structuredPrompt = systemPrompt + "\n\n" + STRUCTURED_OUTPUT_INSTRUCTION;
         switch (settings.provider()) {
             case ApiSettings.OPENAI:
-                return translateOpenAi(image, systemPrompt, settings, secrets.get("openai_key"));
+                return translateOpenAi(image, structuredPrompt, settings, secrets.get("openai_key"));
             case ApiSettings.VERTEX:
-                return translateVertex(image, systemPrompt, settings, secrets.get("vertex_json"));
+                return translateVertex(image, structuredPrompt, settings, secrets.get("vertex_json"));
             case ApiSettings.GEMINI:
             default:
-                return translateGemini(image, systemPrompt, settings, secrets.get("gemini_key"));
+                return translateGemini(image, structuredPrompt, settings, secrets.get("gemini_key"));
         }
     }
 
@@ -69,7 +80,7 @@ public final class TranslationClient {
         JSONObject body = new JSONObject();
         body.put("model", settings.openAiModel());
         body.put("instructions", systemPrompt);
-        body.put("max_output_tokens", 3000);
+        body.put("max_output_tokens", 5000);
 
         JSONArray input = new JSONArray();
         JSONObject message = new JSONObject();
@@ -88,9 +99,10 @@ public final class TranslationClient {
         headers.put("Authorization", "Bearer " + apiKey.trim());
         JSONObject response = postJson(settings.openAiEndpoint(), body, headers);
 
-        String text = parseOpenAiText(response);
+        String rawText = parseOpenAiText(response);
         TokenUsage usage = parseOpenAiUsage(response);
-        return new TranslationResult(text, usage);
+        ParsedTranslation parsed = parseStructuredTranslation(rawText);
+        return new TranslationResult(parsed.text, usage, parsed.blocks);
     }
 
     private static String parseOpenAiText(JSONObject response) {
@@ -154,7 +166,8 @@ public final class TranslationClient {
                 .put("contents", new JSONArray().put(new JSONObject().put("role", "user").put("parts", parts)))
                 .put("generationConfig", new JSONObject()
                         .put("temperature", 0.2)
-                        .put("maxOutputTokens", 3000));
+                        .put("maxOutputTokens", 5000)
+                        .put("responseMimeType", "application/json"));
         Map<String, String> headers = new HashMap<>();
         headers.put("x-goog-api-key", apiKey.trim());
         JSONObject response = postJson(endpoint, body, headers);
@@ -194,7 +207,8 @@ public final class TranslationClient {
                 .put("contents", new JSONArray().put(new JSONObject().put("role", "user").put("parts", parts)))
                 .put("generationConfig", new JSONObject()
                         .put("temperature", 0.2)
-                        .put("maxOutputTokens", 3000));
+                        .put("maxOutputTokens", 5000)
+                        .put("responseMimeType", "application/json"));
         Map<String, String> headers = new HashMap<>();
         headers.put("Authorization", "Bearer " + token);
         JSONObject response = postJson(endpoint, body, headers);
@@ -233,7 +247,158 @@ public final class TranslationClient {
             int reasoning = usage.optInt("thoughtsTokenCount", -1);
             tokenUsage = new TokenUsage(input, output, total, reasoning);
         }
-        return new TranslationResult(result.toString().trim(), tokenUsage);
+        ParsedTranslation parsed = parseStructuredTranslation(result.toString().trim());
+        return new TranslationResult(parsed.text, tokenUsage, parsed.blocks);
+    }
+
+    private static ParsedTranslation parseStructuredTranslation(String rawText) {
+        String clean = stripCodeFence(rawText == null ? "" : rawText.trim());
+        List<TranslationBlock> blocks = new ArrayList<>();
+        List<String> unplacedTexts = new ArrayList<>();
+        try {
+            JSONArray values;
+            if (clean.startsWith("[")) {
+                values = new JSONArray(clean);
+            } else {
+                int start = clean.indexOf('{');
+                int end = clean.lastIndexOf('}');
+                if (start < 0 || end <= start) throw new IllegalArgumentException("JSON 객체 없음");
+                JSONObject root = new JSONObject(clean.substring(start, end + 1));
+                values = root.optJSONArray("blocks");
+                if (values == null) values = root.optJSONArray("translations");
+                if (values == null) values = new JSONArray();
+            }
+            for (int i = 0; i < values.length(); i++) {
+                JSONObject item = values.optJSONObject(i);
+                if (item == null) continue;
+                String text = firstNonEmpty(item.optString("text", ""),
+                        item.optString("translation", ""), item.optString("translated_text", "")).trim();
+                if (text.isEmpty()) continue;
+
+                double x = item.optDouble("x", Double.NaN);
+                double y = item.optDouble("y", Double.NaN);
+                double width = item.optDouble("width", Double.NaN);
+                double height = item.optDouble("height", Double.NaN);
+                JSONObject boxObject = item.optJSONObject("box");
+                if (boxObject != null) {
+                    x = boxObject.optDouble("x", x);
+                    y = boxObject.optDouble("y", y);
+                    width = boxObject.optDouble("width", width);
+                    height = boxObject.optDouble("height", height);
+                }
+                JSONArray boxArray = item.optJSONArray("box");
+                if (boxArray != null && boxArray.length() >= 4) {
+                    x = boxArray.optDouble(0, x);
+                    y = boxArray.optDouble(1, y);
+                    width = boxArray.optDouble(2, width);
+                    height = boxArray.optDouble(3, height);
+                }
+                if ((!isFinitePositive(width) || !isFinitePositive(height)
+                        || Double.isNaN(x) || Double.isNaN(y))) {
+                    double x1 = item.optDouble("x1", Double.NaN);
+                    double y1 = item.optDouble("y1", Double.NaN);
+                    double x2 = item.optDouble("x2", Double.NaN);
+                    double y2 = item.optDouble("y2", Double.NaN);
+                    if (!Double.isNaN(x1) && !Double.isNaN(y1)
+                            && !Double.isNaN(x2) && !Double.isNaN(y2)
+                            && x2 > x1 && y2 > y1) {
+                        x = x1;
+                        y = y1;
+                        width = x2 - x1;
+                        height = y2 - y1;
+                    } else {
+                        unplacedTexts.add(text);
+                        continue;
+                    }
+                }
+
+                double maxValue = Math.max(Math.max(Math.abs(x), Math.abs(y)),
+                        Math.max(Math.abs(width), Math.abs(height)));
+                if (maxValue <= 1.5d) {
+                    x *= 1000d;
+                    y *= 1000d;
+                    width *= 1000d;
+                    height *= 1000d;
+                }
+                float safeX = clamp((float) x, 0f, 999f);
+                float safeY = clamp((float) y, 0f, 999f);
+                float safeWidth = clamp((float) width, 1f, 1000f - safeX);
+                float safeHeight = clamp((float) height, 1f, 1000f - safeY);
+                blocks.add(new TranslationBlock(text, safeX, safeY, safeWidth, safeHeight));
+            }
+        } catch (Exception ignored) {
+            // Some compatible endpoints ignore JSON-only instructions. The fallback below
+            // still renders the translation in a translucent image overlay instead of a bottom bar.
+        }
+
+
+        if (!unplacedTexts.isEmpty()) {
+            int count = unplacedTexts.size();
+            float height = Math.min(220f, Math.max(90f, 760f / Math.max(1, count)));
+            float startY = Math.max(40f, 500f - (count * height) * 0.5f);
+            for (int i = 0; i < count; i++) {
+                float y = clamp(startY + i * height, 20f, 900f);
+                blocks.add(new TranslationBlock(unplacedTexts.get(i), 80f, y, 840f,
+                        Math.min(height - 12f, 1000f - y)));
+            }
+        }
+
+        if (blocks.isEmpty() && !clean.isEmpty()
+                && !clean.equals("{\"blocks\":[]}") && !clean.equals("[]")) {
+            String fallbackText = clean;
+            try {
+                JSONObject root = new JSONObject(clean);
+                if (root.optJSONArray("blocks") != null && root.optJSONArray("blocks").length() == 0) {
+                    fallbackText = "";
+                }
+            } catch (Exception ignored) {}
+            if (!fallbackText.isEmpty()) {
+                blocks.add(new TranslationBlock(fallbackText, 80f, 690f, 840f, 240f));
+            }
+        }
+
+        StringBuilder combined = new StringBuilder();
+        for (TranslationBlock block : blocks) {
+            if (combined.length() > 0) combined.append("\n\n");
+            combined.append(block.text);
+        }
+        String text = combined.length() == 0 ? "[번역할 텍스트 없음]" : combined.toString();
+        return new ParsedTranslation(text, blocks);
+    }
+
+    private static String stripCodeFence(String value) {
+        String clean = value.trim();
+        if (clean.startsWith("```")) {
+            int firstNewline = clean.indexOf('\n');
+            if (firstNewline >= 0) clean = clean.substring(firstNewline + 1);
+            int closing = clean.lastIndexOf("```");
+            if (closing >= 0) clean = clean.substring(0, closing);
+        }
+        return clean.trim();
+    }
+
+    private static String firstNonEmpty(String... values) {
+        for (String value : values) {
+            if (value != null && !value.trim().isEmpty()) return value;
+        }
+        return "";
+    }
+
+    private static boolean isFinitePositive(double value) {
+        return !Double.isNaN(value) && !Double.isInfinite(value) && value > 0d;
+    }
+
+    private static float clamp(float value, float min, float max) {
+        return Math.max(min, Math.min(max, value));
+    }
+
+    private static final class ParsedTranslation {
+        final String text;
+        final List<TranslationBlock> blocks;
+        ParsedTranslation(String text, List<TranslationBlock> blocks) {
+            this.text = text;
+            this.blocks = blocks;
+        }
     }
 
     private static int deriveTotal(int input, int output) {
@@ -325,7 +490,7 @@ public final class TranslationClient {
         connection.setDoOutput(true);
         connection.setRequestProperty("Content-Type", contentType);
         connection.setRequestProperty("Accept", "application/json");
-        connection.setRequestProperty("User-Agent", "ImageLingo/0.2 Android");
+        connection.setRequestProperty("User-Agent", "ImageLingo/0.3 Android");
         for (Map.Entry<String, String> entry : headers.entrySet()) {
             connection.setRequestProperty(entry.getKey(), entry.getValue());
         }
@@ -385,10 +550,28 @@ public final class TranslationClient {
     public static final class TranslationResult {
         public final String text;
         public final TokenUsage usage;
+        public final List<TranslationBlock> blocks;
 
-        TranslationResult(String text, TokenUsage usage) {
-            this.text = text;
+        TranslationResult(String text, TokenUsage usage, List<TranslationBlock> blocks) {
+            this.text = text == null ? "" : text;
             this.usage = usage == null ? TokenUsage.unavailable() : usage;
+            this.blocks = blocks == null ? new ArrayList<>() : new ArrayList<>(blocks);
+        }
+    }
+
+    public static final class TranslationBlock {
+        public final String text;
+        public final float x;
+        public final float y;
+        public final float width;
+        public final float height;
+
+        TranslationBlock(String text, float x, float y, float width, float height) {
+            this.text = text;
+            this.x = x;
+            this.y = y;
+            this.width = width;
+            this.height = height;
         }
     }
 

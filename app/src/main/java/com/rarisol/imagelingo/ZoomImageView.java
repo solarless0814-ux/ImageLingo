@@ -11,6 +11,7 @@ import android.widget.ImageView;
 
 public final class ZoomImageView extends ImageView {
     public interface PageSwipeListener { void onPageSwipe(int direction); }
+    public interface ImageMatrixListener { void onImageMatrixChanged(Matrix matrix); }
 
     private final Matrix imageMatrixValue = new Matrix();
     private final ScaleGestureDetector scaleDetector;
@@ -18,6 +19,7 @@ public final class ZoomImageView extends ImageView {
     private float minScale = 1f;
     private float currentScale = 1f;
     private PageSwipeListener pageSwipeListener;
+    private ImageMatrixListener imageMatrixListener;
 
     public ZoomImageView(Context context) {
         super(context);
@@ -74,6 +76,19 @@ public final class ZoomImageView extends ImageView {
 
     public void setPageSwipeListener(PageSwipeListener listener) { this.pageSwipeListener = listener; }
 
+    public void setImageMatrixListener(ImageMatrixListener listener) {
+        this.imageMatrixListener = listener;
+        if (listener != null) listener.onImageMatrixChanged(new Matrix(imageMatrixValue));
+    }
+
+    public Matrix copyImageMatrix() { return new Matrix(imageMatrixValue); }
+
+    private void notifyMatrixChanged() {
+        if (imageMatrixListener != null) {
+            imageMatrixListener.onImageMatrixChanged(new Matrix(imageMatrixValue));
+        }
+    }
+
     @Override public boolean onTouchEvent(MotionEvent event) {
         scaleDetector.onTouchEvent(event);
         gestureDetector.onTouchEvent(event);
@@ -105,6 +120,7 @@ public final class ZoomImageView extends ImageView {
         minScale = scale;
         currentScale = scale;
         setImageMatrix(imageMatrixValue);
+        notifyMatrixChanged();
     }
 
     private void clampAndApply() {
@@ -121,5 +137,6 @@ public final class ZoomImageView extends ImageView {
         else if (rect.bottom < getHeight()) dy = getHeight() - rect.bottom;
         imageMatrixValue.postTranslate(dx, dy);
         setImageMatrix(imageMatrixValue);
+        notifyMatrixChanged();
     }
 }

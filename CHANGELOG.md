@@ -1,13 +1,23 @@
 # Changelog
 
+## 0.3.0
+
+- 원문 위치별 반투명 번역 오버레이 추가
+- AI 응답을 번역문과 정규화 좌표가 포함된 JSON으로 변경
+- 확대·이동 행렬과 번역 오버레이 동기화
+- 번역문 길이에 따른 오버레이·글자 크기 자동 조절
+- 번역 숨기기/보기 및 길게 눌러 복사 기능 추가
+- 좌표 JSON을 반환하지 않는 호환 API를 위한 중앙 오버레이 예비 처리
+- 토큰 사용량 배지와 사용자 시스템 프롬프트 기능 유지
+
 ## 0.2.0
 
-- Added editable system prompt support for OpenAI, Gemini API, and Vertex AI.
-- Added actual API token usage parsing and bottom-right usage badge.
-- Redesigned the reader UI with floating rounded controls and a bottom translation sheet.
-- Migrated the 0.1 custom prompt preference to the new system prompt setting.
-- Cached the GitHub Actions debug keystore for installable future updates.
+- 시스템 프롬프트 입력 및 API별 시스템 지시문 전달
+- UI 개편
+- 실제 API 토큰 사용량 표시
+- GitHub Actions 디버그 서명 키 캐시
 
 ## 0.1.0
 
-- Initial image reader and AI translation release.
+- 최초 버전
+- 폴더 이미지 리더와 Gemini/OpenAI/Vertex AI 번역
