@@ -26,47 +26,56 @@ import java.security.PrivateKey;
 import java.security.Signature;
 import java.security.spec.PKCS8EncodedKeySpec;
 import java.util.HashMap;
-import java.util.Iterator;
 import java.util.Map;
 
 public final class TranslationClient {
-    private static final String DEFAULT_PROMPT =
-            "이미지에 보이는 한국어가 아닌 모든 글자를 자연스러운 한국어로 번역해 주세요. " +
-            "만화, 게임, 비주얼노벨의 대사라면 화자 순서, 말투, 존댓말, 감정과 줄바꿈을 최대한 유지하세요. " +
-            "효과음과 UI 문구도 빠뜨리지 마세요. 설명이나 원문 반복 없이 한국어 번역만 출력하세요. " +
+    private static final String DEFAULT_SYSTEM_PROMPT =
+            "당신은 이미지 번역 전문 번역가입니다. 이미지에 보이는 한국어가 아닌 모든 글자를 자연스러운 한국어로 번역하세요. " +
+            "만화, 게임, 비주얼노벨 대사라면 화자 순서, 말투, 존댓말, 감정, 문맥과 줄바꿈을 최대한 유지하세요. " +
+            "효과음, 작은 글씨, UI 문구도 가능한 한 빠뜨리지 마세요. 설명, 해설, 머리말, 원문 반복 없이 한국어 번역만 출력하세요. " +
             "번역할 글자가 없으면 [번역할 텍스트 없음]이라고 출력하세요.";
+
+    private static final String USER_REQUEST =
+            "첨부한 이미지 안의 외국어 문구를 시스템 지시문에 따라 한국어로 번역해 주세요.";
 
     private static final Map<String, CachedToken> TOKEN_CACHE = new HashMap<>();
 
-    public static String translate(ContentResolver resolver, Uri imageUri, ApiSettings settings,
-                                   SecureStore secrets) throws Exception {
+    public static String defaultSystemPrompt() {
+        return DEFAULT_SYSTEM_PROMPT;
+    }
+
+    public static TranslationResult translate(ContentResolver resolver, Uri imageUri,
+                                              ApiSettings settings, SecureStore secrets) throws Exception {
         ImagePayload image = encodeImage(resolver, imageUri);
-        String prompt = settings.customPrompt().isEmpty() ? DEFAULT_PROMPT : settings.customPrompt();
+        String systemPrompt = settings.systemPrompt().trim().isEmpty()
+                ? DEFAULT_SYSTEM_PROMPT : settings.systemPrompt().trim();
         switch (settings.provider()) {
             case ApiSettings.OPENAI:
-                return translateOpenAi(image, prompt, settings, secrets.get("openai_key"));
+                return translateOpenAi(image, systemPrompt, settings, secrets.get("openai_key"));
             case ApiSettings.VERTEX:
-                return translateVertex(image, prompt, settings, secrets.get("vertex_json"));
+                return translateVertex(image, systemPrompt, settings, secrets.get("vertex_json"));
             case ApiSettings.GEMINI:
             default:
-                return translateGemini(image, prompt, settings, secrets.get("gemini_key"));
+                return translateGemini(image, systemPrompt, settings, secrets.get("gemini_key"));
         }
     }
 
-    private static String translateOpenAi(ImagePayload image, String prompt, ApiSettings settings,
-                                          String apiKey) throws Exception {
+    private static TranslationResult translateOpenAi(ImagePayload image, String systemPrompt,
+                                                     ApiSettings settings, String apiKey) throws Exception {
         require(apiKey, "OpenAI API 키가 설정되지 않았습니다.");
         require(settings.openAiModel(), "OpenAI 모델명이 비어 있습니다.");
         require(settings.openAiEndpoint(), "OpenAI 엔드포인트가 비어 있습니다.");
 
         JSONObject body = new JSONObject();
         body.put("model", settings.openAiModel());
+        body.put("instructions", systemPrompt);
         body.put("max_output_tokens", 3000);
+
         JSONArray input = new JSONArray();
         JSONObject message = new JSONObject();
         message.put("role", "user");
         JSONArray content = new JSONArray();
-        content.put(new JSONObject().put("type", "input_text").put("text", prompt));
+        content.put(new JSONObject().put("type", "input_text").put("text", USER_REQUEST));
         content.put(new JSONObject()
                 .put("type", "input_image")
                 .put("detail", "high")
@@ -78,6 +87,13 @@ public final class TranslationClient {
         Map<String, String> headers = new HashMap<>();
         headers.put("Authorization", "Bearer " + apiKey.trim());
         JSONObject response = postJson(settings.openAiEndpoint(), body, headers);
+
+        String text = parseOpenAiText(response);
+        TokenUsage usage = parseOpenAiUsage(response);
+        return new TranslationResult(text, usage);
+    }
+
+    private static String parseOpenAiText(JSONObject response) {
         String direct = response.optString("output_text", "").trim();
         if (!direct.isEmpty()) return direct;
 
@@ -85,8 +101,8 @@ public final class TranslationClient {
         JSONArray output = response.optJSONArray("output");
         if (output != null) {
             for (int i = 0; i < output.length(); i++) {
-                JSONArray parts = output.optJSONObject(i) == null ? null
-                        : output.optJSONObject(i).optJSONArray("content");
+                JSONObject outputItem = output.optJSONObject(i);
+                JSONArray parts = outputItem == null ? null : outputItem.optJSONArray("content");
                 if (parts == null) continue;
                 for (int j = 0; j < parts.length(); j++) {
                     JSONObject part = parts.optJSONObject(j);
@@ -99,12 +115,26 @@ public final class TranslationClient {
                 }
             }
         }
-        if (text.length() == 0) throw new IllegalStateException("OpenAI 응답에서 번역문을 찾지 못했습니다.");
+        if (text.length() == 0) {
+            throw new IllegalStateException("OpenAI 응답에서 번역문을 찾지 못했습니다.");
+        }
         return text.toString().trim();
     }
 
-    private static String translateGemini(ImagePayload image, String prompt, ApiSettings settings,
-                                          String apiKey) throws Exception {
+    private static TokenUsage parseOpenAiUsage(JSONObject response) {
+        JSONObject usage = response.optJSONObject("usage");
+        if (usage == null) return TokenUsage.unavailable();
+        int input = usage.optInt("input_tokens", -1);
+        int output = usage.optInt("output_tokens", -1);
+        int total = usage.optInt("total_tokens", deriveTotal(input, output));
+        int reasoning = -1;
+        JSONObject details = usage.optJSONObject("output_tokens_details");
+        if (details != null) reasoning = details.optInt("reasoning_tokens", -1);
+        return new TokenUsage(input, output, total, reasoning);
+    }
+
+    private static TranslationResult translateGemini(ImagePayload image, String systemPrompt,
+                                                     ApiSettings settings, String apiKey) throws Exception {
         require(apiKey, "Gemini API 키가 설정되지 않았습니다.");
         require(settings.geminiModel(), "Gemini 모델명이 비어 있습니다.");
         String model = settings.geminiModel().replace("models/", "");
@@ -115,9 +145,12 @@ public final class TranslationClient {
                 .put("mime_type", image.mimeType)
                 .put("data", image.base64);
         JSONArray parts = new JSONArray()
-                .put(new JSONObject().put("text", prompt))
+                .put(new JSONObject().put("text", USER_REQUEST))
                 .put(new JSONObject().put("inline_data", inline));
+        JSONObject systemInstruction = new JSONObject()
+                .put("parts", new JSONArray().put(new JSONObject().put("text", systemPrompt)));
         JSONObject body = new JSONObject()
+                .put("system_instruction", systemInstruction)
                 .put("contents", new JSONArray().put(new JSONObject().put("role", "user").put("parts", parts)))
                 .put("generationConfig", new JSONObject()
                         .put("temperature", 0.2)
@@ -125,11 +158,11 @@ public final class TranslationClient {
         Map<String, String> headers = new HashMap<>();
         headers.put("x-goog-api-key", apiKey.trim());
         JSONObject response = postJson(endpoint, body, headers);
-        return parseGeminiText(response, "Gemini");
+        return parseGeminiResult(response, "Gemini");
     }
 
-    private static String translateVertex(ImagePayload image, String prompt, ApiSettings settings,
-                                          String serviceJsonText) throws Exception {
+    private static TranslationResult translateVertex(ImagePayload image, String systemPrompt,
+                                                     ApiSettings settings, String serviceJsonText) throws Exception {
         require(serviceJsonText, "Vertex AI 서비스 계정 JSON을 불러오지 않았습니다.");
         require(settings.vertexModel(), "Vertex AI 모델명이 비어 있습니다.");
         JSONObject service = new JSONObject(serviceJsonText);
@@ -152,9 +185,12 @@ public final class TranslationClient {
                 .put("mimeType", image.mimeType)
                 .put("data", image.base64);
         JSONArray parts = new JSONArray()
-                .put(new JSONObject().put("text", prompt))
+                .put(new JSONObject().put("text", USER_REQUEST))
                 .put(new JSONObject().put("inlineData", inline));
+        JSONObject systemInstruction = new JSONObject()
+                .put("parts", new JSONArray().put(new JSONObject().put("text", systemPrompt)));
         JSONObject body = new JSONObject()
+                .put("systemInstruction", systemInstruction)
                 .put("contents", new JSONArray().put(new JSONObject().put("role", "user").put("parts", parts)))
                 .put("generationConfig", new JSONObject()
                         .put("temperature", 0.2)
@@ -162,28 +198,46 @@ public final class TranslationClient {
         Map<String, String> headers = new HashMap<>();
         headers.put("Authorization", "Bearer " + token);
         JSONObject response = postJson(endpoint, body, headers);
-        return parseGeminiText(response, "Vertex AI");
+        return parseGeminiResult(response, "Vertex AI");
     }
 
-    private static String parseGeminiText(JSONObject response, String provider) throws Exception {
+    private static TranslationResult parseGeminiResult(JSONObject response, String provider) {
         JSONArray candidates = response.optJSONArray("candidates");
         if (candidates == null || candidates.length() == 0) {
             throw new IllegalStateException(provider + " 응답에 번역 후보가 없습니다.");
         }
-        JSONObject content = candidates.getJSONObject(0).optJSONObject("content");
+        JSONObject content = candidates.optJSONObject(0) == null
+                ? null : candidates.optJSONObject(0).optJSONObject("content");
         JSONArray parts = content == null ? null : content.optJSONArray("parts");
         StringBuilder result = new StringBuilder();
         if (parts != null) {
             for (int i = 0; i < parts.length(); i++) {
-                String text = parts.getJSONObject(i).optString("text", "");
+                JSONObject part = parts.optJSONObject(i);
+                String text = part == null ? "" : part.optString("text", "");
                 if (!text.isEmpty()) {
                     if (result.length() > 0) result.append('\n');
                     result.append(text);
                 }
             }
         }
-        if (result.length() == 0) throw new IllegalStateException(provider + " 응답에서 번역문을 찾지 못했습니다.");
-        return result.toString().trim();
+        if (result.length() == 0) {
+            throw new IllegalStateException(provider + " 응답에서 번역문을 찾지 못했습니다.");
+        }
+
+        JSONObject usage = response.optJSONObject("usageMetadata");
+        TokenUsage tokenUsage = TokenUsage.unavailable();
+        if (usage != null) {
+            int input = usage.optInt("promptTokenCount", -1);
+            int output = usage.optInt("candidatesTokenCount", -1);
+            int total = usage.optInt("totalTokenCount", deriveTotal(input, output));
+            int reasoning = usage.optInt("thoughtsTokenCount", -1);
+            tokenUsage = new TokenUsage(input, output, total, reasoning);
+        }
+        return new TranslationResult(result.toString().trim(), tokenUsage);
+    }
+
+    private static int deriveTotal(int input, int output) {
+        return input >= 0 && output >= 0 ? input + output : -1;
     }
 
     private static synchronized String getAccessToken(String clientEmail, String pem,
@@ -271,7 +325,7 @@ public final class TranslationClient {
         connection.setDoOutput(true);
         connection.setRequestProperty("Content-Type", contentType);
         connection.setRequestProperty("Accept", "application/json");
-        connection.setRequestProperty("User-Agent", "ImageLingo/0.1 Android");
+        connection.setRequestProperty("User-Agent", "ImageLingo/0.2 Android");
         for (Map.Entry<String, String> entry : headers.entrySet()) {
             connection.setRequestProperty(entry.getKey(), entry.getValue());
         }
@@ -326,6 +380,38 @@ public final class TranslationClient {
 
     private static void require(String value, String message) {
         if (value == null || value.trim().isEmpty()) throw new IllegalStateException(message);
+    }
+
+    public static final class TranslationResult {
+        public final String text;
+        public final TokenUsage usage;
+
+        TranslationResult(String text, TokenUsage usage) {
+            this.text = text;
+            this.usage = usage == null ? TokenUsage.unavailable() : usage;
+        }
+    }
+
+    public static final class TokenUsage {
+        public final int inputTokens;
+        public final int outputTokens;
+        public final int totalTokens;
+        public final int reasoningTokens;
+
+        TokenUsage(int inputTokens, int outputTokens, int totalTokens, int reasoningTokens) {
+            this.inputTokens = inputTokens;
+            this.outputTokens = outputTokens;
+            this.totalTokens = totalTokens;
+            this.reasoningTokens = reasoningTokens;
+        }
+
+        static TokenUsage unavailable() {
+            return new TokenUsage(-1, -1, -1, -1);
+        }
+
+        public boolean isAvailable() {
+            return totalTokens >= 0 || inputTokens >= 0 || outputTokens >= 0;
+        }
     }
 
     private static final class ImagePayload {

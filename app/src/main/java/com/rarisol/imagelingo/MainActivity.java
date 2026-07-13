@@ -4,16 +4,15 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ClipData;
 import android.content.ClipboardManager;
-import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.ImageDecoder;
 import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
-import android.provider.Settings;
 import android.text.InputType;
 import android.util.Size;
 import android.view.Gravity;
@@ -36,6 +35,7 @@ import java.io.BufferedReader;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
+import java.text.NumberFormat;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -49,16 +49,27 @@ public final class MainActivity extends Activity {
     private static final int REQUEST_VERTEX_JSON = 1002;
     private static final String APP_PREFS = "app_state";
 
+    private static final int COLOR_BG = 0xFF080A0F;
+    private static final int COLOR_SURFACE = 0xF21A1D27;
+    private static final int COLOR_SURFACE_2 = 0xFF232733;
+    private static final int COLOR_PRIMARY = 0xFF7867FF;
+    private static final int COLOR_PRIMARY_2 = 0xFF4DA8FF;
+    private static final int COLOR_TEXT = 0xFFF6F7FB;
+    private static final int COLOR_MUTED = 0xFFA8ADBC;
+    private static final int COLOR_STROKE = 0xFF343947;
+
     private final ExecutorService executor = Executors.newFixedThreadPool(2);
     private final AtomicInteger imageLoadVersion = new AtomicInteger();
-    private final Map<String, String> translationCache = new HashMap<>();
+    private final Map<String, TranslationClient.TranslationResult> translationCache = new HashMap<>();
 
     private ZoomImageView imageView;
     private TextView titleView;
+    private TextView subtitleView;
     private ProgressBar progressBar;
     private LinearLayout translationPanel;
     private TextView translationTitle;
     private TextView translationText;
+    private TextView tokenBadge;
     private Button translateButton;
     private TextView vertexStatusText;
 
@@ -71,8 +82,8 @@ public final class MainActivity extends Activity {
 
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        getWindow().setStatusBarColor(Color.BLACK);
-        getWindow().setNavigationBarColor(Color.BLACK);
+        getWindow().setStatusBarColor(COLOR_BG);
+        getWindow().setNavigationBarColor(COLOR_BG);
         apiSettings = new ApiSettings(this);
         secureStore = new SecureStore(this);
         appPrefs = getSharedPreferences(APP_PREFS, MODE_PRIVATE);
@@ -88,93 +99,169 @@ public final class MainActivity extends Activity {
 
     private void buildUi() {
         FrameLayout root = new FrameLayout(this);
-        root.setBackgroundColor(Color.BLACK);
+        root.setBackgroundColor(COLOR_BG);
 
         imageView = new ZoomImageView(this);
+        imageView.setBackgroundColor(COLOR_BG);
         imageView.setPageSwipeListener(this::movePage);
-        root.addView(imageView, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        FrameLayout.LayoutParams imageParams = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
+        imageParams.topMargin = dp(76);
+        imageParams.bottomMargin = dp(84);
+        root.addView(imageView, imageParams);
 
-        int barHeight = dp(56);
         LinearLayout topBar = new LinearLayout(this);
         topBar.setOrientation(LinearLayout.HORIZONTAL);
         topBar.setGravity(Gravity.CENTER_VERTICAL);
-        topBar.setPadding(dp(6), dp(4), dp(6), dp(4));
-        topBar.setBackgroundColor(0xCC111111);
-        Button folderButton = makeButton("폴더");
+        topBar.setPadding(dp(8), dp(6), dp(8), dp(6));
+        topBar.setBackground(roundedBackground(COLOR_SURFACE, 20, COLOR_STROKE));
+        topBar.setElevation(dp(8));
+
+        Button folderButton = makeToolbarButton("폴더");
         folderButton.setOnClickListener(v -> chooseFolder());
+
+        LinearLayout titleGroup = new LinearLayout(this);
+        titleGroup.setOrientation(LinearLayout.VERTICAL);
+        titleGroup.setGravity(Gravity.CENTER);
         titleView = new TextView(this);
-        titleView.setTextColor(Color.WHITE);
+        titleView.setTextColor(COLOR_TEXT);
         titleView.setTextSize(14f);
+        titleView.setTypeface(Typeface.DEFAULT_BOLD);
         titleView.setGravity(Gravity.CENTER);
         titleView.setSingleLine(true);
-        Button settingsButton = makeButton("설정");
+        subtitleView = new TextView(this);
+        subtitleView.setTextColor(COLOR_MUTED);
+        subtitleView.setTextSize(11f);
+        subtitleView.setGravity(Gravity.CENTER);
+        subtitleView.setSingleLine(true);
+        titleGroup.addView(titleView, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        titleGroup.addView(subtitleView, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        Button settingsButton = makeToolbarButton("설정");
         settingsButton.setOnClickListener(v -> showSettingsDialog());
+
         topBar.addView(folderButton, new LinearLayout.LayoutParams(dp(70), ViewGroup.LayoutParams.MATCH_PARENT));
-        topBar.addView(titleView, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
+        topBar.addView(titleGroup, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
         topBar.addView(settingsButton, new LinearLayout.LayoutParams(dp(70), ViewGroup.LayoutParams.MATCH_PARENT));
+
         FrameLayout.LayoutParams topParams = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, barHeight, Gravity.TOP);
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(62), Gravity.TOP);
+        topParams.setMargins(dp(12), dp(8), dp(12), 0);
         root.addView(topBar, topParams);
 
         LinearLayout bottomBar = new LinearLayout(this);
         bottomBar.setOrientation(LinearLayout.HORIZONTAL);
         bottomBar.setGravity(Gravity.CENTER);
-        bottomBar.setPadding(dp(6), dp(4), dp(6), dp(4));
-        bottomBar.setBackgroundColor(0xDD111111);
-        Button previous = makeButton("〈 이전");
+        bottomBar.setPadding(dp(6), dp(6), dp(6), dp(6));
+        bottomBar.setBackground(roundedBackground(COLOR_SURFACE, 22, COLOR_STROKE));
+        bottomBar.setElevation(dp(10));
+
+        Button previous = makeNavButton("〈  이전");
         previous.setOnClickListener(v -> movePage(-1));
-        translateButton = makeButton("번역");
-        translateButton.setTypeface(Typeface.DEFAULT_BOLD);
+        translateButton = makePrimaryButton("이미지 번역");
         translateButton.setOnClickListener(v -> translateCurrent());
-        Button next = makeButton("다음 〉");
+        Button next = makeNavButton("다음  〉");
         next.setOnClickListener(v -> movePage(1));
-        bottomBar.addView(previous, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
-        bottomBar.addView(translateButton, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
-        bottomBar.addView(next, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
+
+        LinearLayout.LayoutParams navParams = new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.MATCH_PARENT, 1f);
+        navParams.setMargins(dp(2), 0, dp(2), 0);
+        LinearLayout.LayoutParams translateParams = new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.MATCH_PARENT, 1.25f);
+        translateParams.setMargins(dp(4), 0, dp(4), 0);
+        bottomBar.addView(previous, navParams);
+        bottomBar.addView(translateButton, translateParams);
+        bottomBar.addView(next, navParams);
+
         FrameLayout.LayoutParams bottomParams = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, barHeight, Gravity.BOTTOM);
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(66), Gravity.BOTTOM);
+        bottomParams.setMargins(dp(12), 0, dp(12), dp(10));
         root.addView(bottomBar, bottomParams);
 
         translationPanel = new LinearLayout(this);
         translationPanel.setOrientation(LinearLayout.VERTICAL);
-        translationPanel.setPadding(dp(12), dp(8), dp(12), dp(8));
-        translationPanel.setBackgroundColor(0xEE181818);
+        translationPanel.setPadding(dp(18), dp(12), dp(18), dp(10));
+        translationPanel.setBackground(roundedTopBackground(0xFA151821, 26, COLOR_STROKE));
+        translationPanel.setElevation(dp(14));
         translationPanel.setVisibility(View.GONE);
+
         LinearLayout panelHeader = new LinearLayout(this);
         panelHeader.setOrientation(LinearLayout.HORIZONTAL);
         panelHeader.setGravity(Gravity.CENTER_VERTICAL);
+
+        LinearLayout panelTitleGroup = new LinearLayout(this);
+        panelTitleGroup.setOrientation(LinearLayout.VERTICAL);
         translationTitle = new TextView(this);
-        translationTitle.setTextColor(0xFFB7DCFF);
-        translationTitle.setTextSize(14f);
+        translationTitle.setTextColor(0xFFBFD5FF);
+        translationTitle.setTextSize(15f);
         translationTitle.setTypeface(Typeface.DEFAULT_BOLD);
-        Button copy = makeSmallButton("복사");
+        TextView panelCaption = new TextView(this);
+        panelCaption.setText("번역 결과");
+        panelCaption.setTextColor(COLOR_MUTED);
+        panelCaption.setTextSize(11f);
+        panelTitleGroup.addView(translationTitle);
+        panelTitleGroup.addView(panelCaption);
+
+        Button copy = makePanelButton("복사");
         copy.setOnClickListener(v -> copyTranslation());
-        Button close = makeSmallButton("닫기");
-        close.setOnClickListener(v -> translationPanel.setVisibility(View.GONE));
-        panelHeader.addView(translationTitle, new LinearLayout.LayoutParams(0, dp(42), 1f));
-        panelHeader.addView(copy, new LinearLayout.LayoutParams(dp(62), dp(42)));
-        panelHeader.addView(close, new LinearLayout.LayoutParams(dp(62), dp(42)));
+        Button close = makePanelButton("닫기");
+        close.setOnClickListener(v -> {
+            translationPanel.setVisibility(View.GONE);
+            tokenBadge.setVisibility(View.GONE);
+        });
+
+        panelHeader.addView(panelTitleGroup, new LinearLayout.LayoutParams(0, dp(50), 1f));
+        LinearLayout.LayoutParams panelButtonParams = new LinearLayout.LayoutParams(dp(62), dp(38));
+        panelButtonParams.setMargins(dp(5), 0, 0, 0);
+        panelHeader.addView(copy, panelButtonParams);
+        panelHeader.addView(close, panelButtonParams);
         translationPanel.addView(panelHeader);
+
+        View divider = new View(this);
+        divider.setBackgroundColor(COLOR_STROKE);
+        LinearLayout.LayoutParams dividerParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(1));
+        dividerParams.setMargins(0, dp(3), 0, dp(7));
+        translationPanel.addView(divider, dividerParams);
+
         ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(false);
         translationText = new TextView(this);
-        translationText.setTextColor(Color.WHITE);
+        translationText.setTextColor(COLOR_TEXT);
         translationText.setTextSize(17f);
         translationText.setTextIsSelectable(true);
-        translationText.setLineSpacing(0f, 1.15f);
-        translationText.setPadding(dp(4), dp(4), dp(4), dp(12));
+        translationText.setLineSpacing(dp(2), 1.16f);
+        translationText.setPadding(dp(2), dp(4), dp(2), dp(52));
         scroll.addView(translationText, new ScrollView.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         translationPanel.addView(scroll, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
         FrameLayout.LayoutParams panelParams = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(320), Gravity.BOTTOM);
-        panelParams.bottomMargin = barHeight;
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(350), Gravity.BOTTOM);
+        panelParams.setMargins(dp(8), 0, dp(8), dp(82));
         root.addView(translationPanel, panelParams);
+
+        tokenBadge = new TextView(this);
+        tokenBadge.setTextColor(COLOR_TEXT);
+        tokenBadge.setTextSize(11f);
+        tokenBadge.setTypeface(Typeface.DEFAULT_BOLD);
+        tokenBadge.setGravity(Gravity.CENTER);
+        tokenBadge.setPadding(dp(12), dp(7), dp(12), dp(7));
+        tokenBadge.setBackground(roundedBackground(0xF22A2E3B, 18, 0xFF4A5060));
+        tokenBadge.setElevation(dp(18));
+        tokenBadge.setVisibility(View.GONE);
+        FrameLayout.LayoutParams tokenParams = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM | Gravity.END);
+        tokenParams.setMargins(0, 0, dp(20), dp(94));
+        root.addView(tokenBadge, tokenParams);
 
         progressBar = new ProgressBar(this);
         progressBar.setVisibility(View.GONE);
-        FrameLayout.LayoutParams progressParams = new FrameLayout.LayoutParams(dp(56), dp(56), Gravity.CENTER);
+        FrameLayout.LayoutParams progressParams = new FrameLayout.LayoutParams(dp(54), dp(54), Gravity.CENTER);
         root.addView(progressBar, progressParams);
 
         setContentView(root);
@@ -182,9 +269,11 @@ public final class MainActivity extends Activity {
 
     private void showWelcome() {
         titleView.setText("ImageLingo");
+        subtitleView.setText("AI 이미지 번역 리더");
         translationTitle.setText("시작하기");
         translationText.setText("상단의 ‘폴더’를 눌러 이미지가 들어 있는 폴더를 선택하세요.\n\n"
-                + "그다음 ‘설정’에서 Gemini, OpenAI 또는 Vertex AI 인증 정보를 입력하고 이미지 아래의 ‘번역’을 누르면 됩니다.");
+                + "‘설정’에서 Gemini, OpenAI 또는 Vertex AI 인증 정보와 시스템 프롬프트를 입력한 뒤, 하단의 ‘이미지 번역’을 누르면 됩니다.");
+        tokenBadge.setVisibility(View.GONE);
         translationPanel.setVisibility(View.VISIBLE);
     }
 
@@ -236,7 +325,7 @@ public final class MainActivity extends Activity {
                 if (!project.isEmpty()) {
                     apiSettings.save(apiSettings.provider(), apiSettings.openAiModel(), apiSettings.openAiEndpoint(),
                             apiSettings.geminiModel(), apiSettings.vertexModel(), apiSettings.vertexLocation(),
-                            project, apiSettings.customPrompt());
+                            project, apiSettings.systemPrompt());
                 }
                 runOnUiThread(() -> {
                     if (vertexStatusText != null) vertexStatusText.setText("불러옴: " + json.optString("client_email"));
@@ -251,7 +340,9 @@ public final class MainActivity extends Activity {
     private void loadFolder(Uri treeUri) {
         progressBar.setVisibility(View.VISIBLE);
         titleView.setText("폴더 읽는 중…");
+        subtitleView.setText("");
         translationPanel.setVisibility(View.GONE);
+        tokenBadge.setVisibility(View.GONE);
         executor.execute(() -> {
             try {
                 List<ImageRepository.ImageEntry> loaded = ImageRepository.listImages(getContentResolver(), treeUri);
@@ -261,6 +352,7 @@ public final class MainActivity extends Activity {
                     currentIndex = loaded.isEmpty() ? -1 : 0;
                     if (loaded.isEmpty()) {
                         titleView.setText("이미지 없음");
+                        subtitleView.setText("다른 폴더를 선택하세요");
                         translationTitle.setText("폴더가 비어 있습니다");
                         translationText.setText("선택한 폴더의 바로 아래에서 JPG, PNG, WEBP 등의 이미지 파일을 찾지 못했습니다.");
                         translationPanel.setVisibility(View.VISIBLE);
@@ -273,6 +365,7 @@ public final class MainActivity extends Activity {
                 runOnUiThread(() -> {
                     progressBar.setVisibility(View.GONE);
                     titleView.setText("폴더 오류");
+                    subtitleView.setText("");
                     showResult("오류", cleanMessage(e), true);
                 });
             }
@@ -283,8 +376,10 @@ public final class MainActivity extends Activity {
         if (currentIndex < 0 || currentIndex >= images.size()) return;
         int version = imageLoadVersion.incrementAndGet();
         ImageRepository.ImageEntry entry = images.get(currentIndex);
-        titleView.setText((currentIndex + 1) + " / " + images.size() + "  " + entry.name);
+        titleView.setText(entry.name);
+        subtitleView.setText((currentIndex + 1) + " / " + images.size() + "  ·  " + providerLabel());
         translationPanel.setVisibility(View.GONE);
+        tokenBadge.setVisibility(View.GONE);
         progressBar.setVisibility(View.VISIBLE);
         executor.execute(() -> {
             try {
@@ -341,28 +436,38 @@ public final class MainActivity extends Activity {
             return;
         }
         ImageRepository.ImageEntry entry = images.get(currentIndex);
-        String cacheKey = entry.uri + "|" + apiSettings.provider() + "|" + activeModel();
-        String cached = translationCache.get(cacheKey);
+        String cacheKey = entry.uri + "|" + apiSettings.provider() + "|" + activeModel()
+                + "|" + apiSettings.openAiEndpoint() + "|" + apiSettings.systemPrompt().hashCode();
+        TranslationClient.TranslationResult cached = translationCache.get(cacheKey);
         if (cached != null) {
-            showResult(providerLabel() + " · 캐시", cached, false);
+            showResult(providerLabel() + " · 캐시", cached.text, false);
+            showTokenUsage(cached.usage, true);
             return;
         }
+
         translateButton.setEnabled(false);
+        translateButton.setText("번역 중…");
         progressBar.setVisibility(View.VISIBLE);
-        showResult(providerLabel(), "번역 중…", false);
+        tokenBadge.setVisibility(View.GONE);
+        showResult(providerLabel(), "이미지의 글자를 읽고 번역하고 있습니다…", false);
         executor.execute(() -> {
             try {
-                String result = TranslationClient.translate(getContentResolver(), entry.uri, apiSettings, secureStore);
+                TranslationClient.TranslationResult result = TranslationClient.translate(
+                        getContentResolver(), entry.uri, apiSettings, secureStore);
                 translationCache.put(cacheKey, result);
                 runOnUiThread(() -> {
                     translateButton.setEnabled(true);
+                    translateButton.setText("이미지 번역");
                     progressBar.setVisibility(View.GONE);
-                    showResult(providerLabel(), result, false);
+                    showResult(providerLabel(), result.text, false);
+                    showTokenUsage(result.usage, false);
                 });
             } catch (Exception e) {
                 runOnUiThread(() -> {
                     translateButton.setEnabled(true);
+                    translateButton.setText("이미지 번역");
                     progressBar.setVisibility(View.GONE);
+                    tokenBadge.setVisibility(View.GONE);
                     showResult(providerLabel() + " 오류", cleanMessage(e), true);
                 });
             }
@@ -371,9 +476,30 @@ public final class MainActivity extends Activity {
 
     private void showResult(String title, String text, boolean error) {
         translationTitle.setText(title);
-        translationTitle.setTextColor(error ? 0xFFFF9B9B : 0xFFB7DCFF);
+        translationTitle.setTextColor(error ? 0xFFFFA3A3 : 0xFFBFD5FF);
         translationText.setText(text);
         translationPanel.setVisibility(View.VISIBLE);
+    }
+
+    private void showTokenUsage(TranslationClient.TokenUsage usage, boolean cached) {
+        if (usage == null || !usage.isAvailable()) {
+            tokenBadge.setText(cached ? "캐시 · 토큰 정보 없음" : "토큰 정보 없음");
+            tokenBadge.setVisibility(View.VISIBLE);
+            return;
+        }
+        NumberFormat format = NumberFormat.getIntegerInstance();
+        StringBuilder value = new StringBuilder();
+        if (cached) value.append("캐시 · ");
+        if (usage.totalTokens >= 0) value.append("총 ").append(format.format(usage.totalTokens));
+        if (usage.inputTokens >= 0 || usage.outputTokens >= 0) {
+            if (value.length() > 0) value.append("  ·  ");
+            if (usage.inputTokens >= 0) value.append("입력 ").append(format.format(usage.inputTokens));
+            if (usage.inputTokens >= 0 && usage.outputTokens >= 0) value.append(" / ");
+            if (usage.outputTokens >= 0) value.append("출력 ").append(format.format(usage.outputTokens));
+        }
+        tokenBadge.setText(value.length() == 0 ? "토큰 정보 없음" : value.toString());
+        tokenBadge.setVisibility(View.VISIBLE);
+        tokenBadge.bringToFront();
     }
 
     private void copyTranslation() {
@@ -388,58 +514,69 @@ public final class MainActivity extends Activity {
         ScrollView scroll = new ScrollView(this);
         LinearLayout form = new LinearLayout(this);
         form.setOrientation(LinearLayout.VERTICAL);
-        form.setPadding(dp(20), dp(8), dp(20), dp(16));
+        form.setPadding(dp(20), dp(10), dp(20), dp(22));
         scroll.addView(form);
 
-        form.addView(label("사용할 API"));
+        TextView intro = caption("API와 모델을 선택하고, 번역 방식은 시스템 프롬프트에서 자유롭게 조정할 수 있습니다.");
+        form.addView(intro, matchWrap());
+
+        form.addView(section("사용할 API"));
         Spinner provider = new Spinner(this);
-        String[] providerNames = {"Gemini API", "OpenAI Responses API", "Vertex AI (서비스 계정 JSON)"};
+        String[] providerNames = {"Gemini API", "OpenAI Responses API", "Vertex AI · 서비스 계정 JSON"};
         provider.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, providerNames));
         provider.setSelection(ApiSettings.OPENAI.equals(apiSettings.provider()) ? 1
                 : ApiSettings.VERTEX.equals(apiSettings.provider()) ? 2 : 0);
-        form.addView(provider, matchWrap());
+        provider.setBackground(roundedBackground(0xFFF1F2F7, 12, 0xFFD5D8E2));
+        provider.setPadding(dp(12), 0, dp(8), 0);
+        LinearLayout.LayoutParams spinnerParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(52));
+        form.addView(provider, spinnerParams);
 
         form.addView(section("OpenAI"));
-        EditText openAiKey = secretField("sk-…", secureStore.get("openai_key"));
+        EditText openAiKey = secretField("API 키 · sk-…", secureStore.get("openai_key"));
         EditText openAiModel = field("모델명", apiSettings.openAiModel());
         EditText openAiEndpoint = field("Responses 엔드포인트", apiSettings.openAiEndpoint());
-        form.addView(openAiKey, matchWrap());
-        form.addView(openAiModel, matchWrap());
-        form.addView(openAiEndpoint, matchWrap());
+        form.addView(openAiKey, fieldParams());
+        form.addView(openAiModel, fieldParams());
+        form.addView(openAiEndpoint, fieldParams());
 
         form.addView(section("Gemini API"));
-        EditText geminiKey = secretField("AIza…", secureStore.get("gemini_key"));
+        EditText geminiKey = secretField("API 키 · AIza…", secureStore.get("gemini_key"));
         EditText geminiModel = field("모델명", apiSettings.geminiModel());
-        form.addView(geminiKey, matchWrap());
-        form.addView(geminiModel, matchWrap());
+        form.addView(geminiKey, fieldParams());
+        form.addView(geminiModel, fieldParams());
 
         form.addView(section("Vertex AI"));
         EditText vertexModel = field("모델명", apiSettings.vertexModel());
-        EditText vertexLocation = field("리전: global, us-central1 등", apiSettings.vertexLocation());
-        EditText vertexProject = field("프로젝트 ID (JSON에서 자동 입력 가능)", apiSettings.vertexProject());
-        form.addView(vertexModel, matchWrap());
-        form.addView(vertexLocation, matchWrap());
-        form.addView(vertexProject, matchWrap());
+        EditText vertexLocation = field("리전 · global, us-central1 등", apiSettings.vertexLocation());
+        EditText vertexProject = field("프로젝트 ID", apiSettings.vertexProject());
+        form.addView(vertexModel, fieldParams());
+        form.addView(vertexLocation, fieldParams());
+        form.addView(vertexProject, fieldParams());
         Button importJson = makeDialogButton("서비스 계정 JSON 불러오기");
         importJson.setOnClickListener(v -> chooseVertexJson());
-        form.addView(importJson, matchWrap());
-        vertexStatusText = new TextView(this);
-        vertexStatusText.setTextColor(0xFF555555);
-        vertexStatusText.setTextSize(13f);
-        String vertexJson = secureStore.get("vertex_json");
-        vertexStatusText.setText(vertexJson.isEmpty() ? "아직 JSON을 불러오지 않았습니다."
+        form.addView(importJson, fieldParams());
+        vertexStatusText = caption(secureStore.get("vertex_json").isEmpty()
+                ? "아직 JSON을 불러오지 않았습니다."
                 : "서비스 계정 JSON이 암호화되어 저장되어 있습니다.");
         form.addView(vertexStatusText, matchWrap());
 
-        form.addView(section("번역 지시문 (선택)"));
-        EditText prompt = field("비워 두면 만화·게임용 기본 번역 지시문 사용", apiSettings.customPrompt());
-        prompt.setMinLines(3);
-        prompt.setGravity(Gravity.TOP | Gravity.START);
-        form.addView(prompt, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(110)));
+        form.addView(section("시스템 프롬프트"));
+        form.addView(caption("번역 어조, 고유명사 처리, 출력 형식 등을 지정합니다. OpenAI의 instructions와 Gemini·Vertex의 system instruction으로 전송됩니다."), matchWrap());
+        EditText systemPrompt = field("비워 두면 기본 만화·게임 번역 프롬프트 사용", apiSettings.systemPrompt());
+        systemPrompt.setMinLines(6);
+        systemPrompt.setGravity(Gravity.TOP | Gravity.START);
+        systemPrompt.setPadding(dp(14), dp(12), dp(14), dp(12));
+        LinearLayout.LayoutParams promptParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(170));
+        promptParams.setMargins(0, dp(8), 0, dp(8));
+        form.addView(systemPrompt, promptParams);
+        Button fillDefault = makeDialogButton("기본 시스템 프롬프트 채우기");
+        fillDefault.setOnClickListener(v -> systemPrompt.setText(TranslationClient.defaultSystemPrompt()));
+        form.addView(fillDefault, fieldParams());
 
         AlertDialog dialog = new AlertDialog.Builder(this)
-                .setTitle("번역 API 설정")
+                .setTitle("AI 번역 설정")
                 .setView(scroll)
                 .setNegativeButton("취소", null)
                 .setPositiveButton("저장", null)
@@ -454,8 +591,12 @@ public final class MainActivity extends Activity {
                         openAiModel.getText().toString(), openAiEndpoint.getText().toString(),
                         geminiModel.getText().toString(), vertexModel.getText().toString(),
                         vertexLocation.getText().toString(), vertexProject.getText().toString(),
-                        prompt.getText().toString());
+                        systemPrompt.getText().toString());
                 translationCache.clear();
+                tokenBadge.setVisibility(View.GONE);
+                if (currentIndex >= 0) {
+                    subtitleView.setText((currentIndex + 1) + " / " + images.size() + "  ·  " + providerLabel());
+                }
                 Toast.makeText(this, "설정을 저장했습니다.", Toast.LENGTH_SHORT).show();
                 dialog.dismiss();
             } catch (Exception e) {
@@ -492,53 +633,85 @@ public final class MainActivity extends Activity {
         return result.toString();
     }
 
-    private Button makeButton(String text) {
-        Button button = new Button(this);
-        button.setText(text);
-        button.setTextColor(Color.WHITE);
-        button.setTextSize(14f);
-        button.setAllCaps(false);
-        button.setBackgroundColor(0xFF2B2B2B);
-        button.setPadding(dp(4), 0, dp(4), 0);
+    private Button makeToolbarButton(String text) {
+        Button button = baseButton(text, 13f, COLOR_TEXT);
+        button.setBackground(roundedBackground(COLOR_SURFACE_2, 14, COLOR_STROKE));
         return button;
     }
 
-    private Button makeSmallButton(String text) {
-        Button button = makeButton(text);
-        button.setTextSize(12f);
+    private Button makeNavButton(String text) {
+        Button button = baseButton(text, 13f, COLOR_TEXT);
+        button.setBackground(roundedBackground(COLOR_SURFACE_2, 16, COLOR_STROKE));
+        return button;
+    }
+
+    private Button makePrimaryButton(String text) {
+        Button button = baseButton(text, 14f, Color.WHITE);
+        button.setTypeface(Typeface.DEFAULT_BOLD);
+        GradientDrawable background = new GradientDrawable(
+                GradientDrawable.Orientation.LEFT_RIGHT,
+                new int[]{COLOR_PRIMARY, COLOR_PRIMARY_2});
+        background.setCornerRadius(dp(16));
+        button.setBackground(background);
+        return button;
+    }
+
+    private Button makePanelButton(String text) {
+        Button button = baseButton(text, 12f, COLOR_TEXT);
+        button.setBackground(roundedBackground(COLOR_SURFACE_2, 13, COLOR_STROKE));
+        return button;
+    }
+
+    private Button baseButton(String text, float textSize, int textColor) {
+        Button button = new Button(this);
+        button.setText(text);
+        button.setTextColor(textColor);
+        button.setTextSize(textSize);
+        button.setAllCaps(false);
+        button.setGravity(Gravity.CENTER);
+        button.setPadding(dp(5), 0, dp(5), 0);
+        button.setMinHeight(0);
+        button.setMinWidth(0);
+        button.setStateListAnimator(null);
         return button;
     }
 
     private Button makeDialogButton(String text) {
-        Button button = new Button(this);
-        button.setText(text);
-        button.setAllCaps(false);
+        Button button = baseButton(text, 14f, 0xFF2E3150);
+        button.setBackground(roundedBackground(0xFFE9E7FF, 12, 0xFFC9C4F5));
         return button;
     }
 
-    private TextView label(String text) {
+    private TextView section(String text) {
         TextView view = new TextView(this);
         view.setText(text);
-        view.setTextSize(14f);
-        view.setTextColor(0xFF333333);
-        view.setPadding(0, dp(8), 0, dp(3));
+        view.setTextSize(17f);
+        view.setTypeface(Typeface.DEFAULT_BOLD);
+        view.setTextColor(0xFF262936);
+        view.setPadding(0, dp(20), 0, dp(7));
         return view;
     }
 
-    private TextView section(String text) {
-        TextView view = label(text);
-        view.setTextSize(17f);
-        view.setTypeface(Typeface.DEFAULT_BOLD);
-        view.setPadding(0, dp(18), 0, dp(5));
+    private TextView caption(String text) {
+        TextView view = new TextView(this);
+        view.setText(text);
+        view.setTextSize(12.5f);
+        view.setTextColor(0xFF666B7A);
+        view.setLineSpacing(dp(1), 1.1f);
+        view.setPadding(0, dp(3), 0, dp(5));
         return view;
     }
 
     private EditText field(String hint, String value) {
         EditText field = new EditText(this);
         field.setHint(hint);
+        field.setHintTextColor(0xFF8D92A0);
+        field.setTextColor(0xFF252833);
         field.setText(value == null ? "" : value);
         field.setSingleLine(false);
         field.setTextSize(14f);
+        field.setPadding(dp(14), dp(8), dp(14), dp(8));
+        field.setBackground(roundedBackground(0xFFF4F5F9, 12, 0xFFD8DBE4));
         return field;
     }
 
@@ -549,8 +722,33 @@ public final class MainActivity extends Activity {
         return field;
     }
 
+    private LinearLayout.LayoutParams fieldParams() {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(52));
+        params.setMargins(0, 0, 0, dp(8));
+        return params;
+    }
+
     private LinearLayout.LayoutParams matchWrap() {
-        return new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        return new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+    }
+
+    private GradientDrawable roundedBackground(int color, int radiusDp, int strokeColor) {
+        GradientDrawable drawable = new GradientDrawable();
+        drawable.setColor(color);
+        drawable.setCornerRadius(dp(radiusDp));
+        if (strokeColor != 0) drawable.setStroke(dp(1), strokeColor);
+        return drawable;
+    }
+
+    private GradientDrawable roundedTopBackground(int color, int radiusDp, int strokeColor) {
+        GradientDrawable drawable = new GradientDrawable();
+        drawable.setColor(color);
+        float radius = dp(radiusDp);
+        drawable.setCornerRadii(new float[]{radius, radius, radius, radius, 0, 0, 0, 0});
+        if (strokeColor != 0) drawable.setStroke(dp(1), strokeColor);
+        return drawable;
     }
 
     private int dp(int value) {

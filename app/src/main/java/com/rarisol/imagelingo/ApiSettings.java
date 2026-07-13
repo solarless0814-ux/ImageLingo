@@ -22,11 +22,17 @@ public final class ApiSettings {
     public String vertexModel() { return prefs.getString("vertex_model", "gemini-2.5-flash"); }
     public String vertexLocation() { return prefs.getString("vertex_location", "global"); }
     public String vertexProject() { return prefs.getString("vertex_project", ""); }
-    public String customPrompt() { return prefs.getString("custom_prompt", ""); }
+
+    public String systemPrompt() {
+        String current = prefs.getString("system_prompt", "");
+        if (current != null && !current.isEmpty()) return current;
+        // 0.1 버전의 번역 지시문을 자동으로 이어받습니다.
+        return prefs.getString("custom_prompt", "");
+    }
 
     public void save(String provider, String openAiModel, String openAiEndpoint,
                      String geminiModel, String vertexModel, String vertexLocation,
-                     String vertexProject, String customPrompt) {
+                     String vertexProject, String systemPrompt) {
         prefs.edit()
                 .putString("provider", provider)
                 .putString("openai_model", openAiModel.trim())
@@ -35,7 +41,8 @@ public final class ApiSettings {
                 .putString("vertex_model", vertexModel.trim())
                 .putString("vertex_location", vertexLocation.trim())
                 .putString("vertex_project", vertexProject.trim())
-                .putString("custom_prompt", customPrompt.trim())
+                .putString("system_prompt", systemPrompt.trim())
+                .remove("custom_prompt")
                 .apply();
     }
 }
