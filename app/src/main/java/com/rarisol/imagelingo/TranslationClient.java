@@ -490,7 +490,7 @@ public final class TranslationClient {
         connection.setDoOutput(true);
         connection.setRequestProperty("Content-Type", contentType);
         connection.setRequestProperty("Accept", "application/json");
-        connection.setRequestProperty("User-Agent", "ImageLingo/0.3 Android");
+        connection.setRequestProperty("User-Agent", "ImageLingo/0.6 Android");
         for (Map.Entry<String, String> entry : headers.entrySet()) {
             connection.setRequestProperty(entry.getKey(), entry.getValue());
         }
