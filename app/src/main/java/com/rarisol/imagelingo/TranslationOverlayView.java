@@ -31,11 +31,11 @@ public final class TranslationOverlayView extends View {
         setFocusable(false);
         setLayerType(LAYER_TYPE_SOFTWARE, null);
 
-        bubblePaint.setColor(0xDFFFFFFF);
+        bubblePaint.setColor(0xF8FFFFFF);
         bubblePaint.setStyle(Paint.Style.FILL);
         bubblePaint.setShadowLayer(dp(7), 0f, dp(2), 0x55000000);
 
-        borderPaint.setColor(0xB83A3F4A);
+        borderPaint.setColor(0xD02A303A);
         borderPaint.setStyle(Paint.Style.STROKE);
         borderPaint.setStrokeWidth(dp(1));
 

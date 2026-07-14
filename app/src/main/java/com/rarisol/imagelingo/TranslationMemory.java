@@ -8,12 +8,12 @@ import org.json.JSONObject;
 
 import java.util.Iterator;
 
-/** Folder-local continuity memory for names, terms, honorifics and recent context. */
+/** Folder-local continuity memory for names, terms, honorifics and one recent page. */
 public final class TranslationMemory {
     public static final String FILE_NAME = "translation_memory.json";
-    private static final int MAX_RECENT_PAGES = 3;
-    private static final int MAX_RECENT_TRANSLATION_CHARS = 2400;
-    private static final int MAX_CONTEXT_CHARS = 18000;
+    private static final int MAX_RECENT_PAGES = 1;
+    private static final int MAX_RECENT_TRANSLATION_CHARS = 1000;
+    private static final int MAX_CONTEXT_CHARS = 8000;
 
     private final JSONObject root;
 
@@ -42,20 +42,14 @@ public final class TranslationMemory {
     public synchronized String buildContextPrompt() {
         JSONObject context = new JSONObject();
         try {
-            context.put("story_summary", root.optString("story_summary", ""));
-            context.put("characters", root.optJSONObject("characters") == null
-                    ? new JSONObject() : root.optJSONObject("characters"));
-            context.put("terms", root.optJSONObject("terms") == null
-                    ? new JSONObject() : root.optJSONObject("terms"));
-            context.put("honorifics", root.optJSONObject("honorifics") == null
-                    ? new JSONObject() : root.optJSONObject("honorifics"));
-            context.put("recent_pages", root.optJSONArray("recent_pages") == null
-                    ? new JSONArray() : root.optJSONArray("recent_pages"));
+            context.put("characters", safeObject(root.optJSONObject("characters")));
+            context.put("terms", safeObject(root.optJSONObject("terms")));
+            context.put("honorifics", safeObject(root.optJSONObject("honorifics")));
+            context.put("recent_pages", safeArray(root.optJSONArray("recent_pages")));
         } catch (Exception ignored) {}
 
         String json = context.toString();
         if (json.length() > MAX_CONTEXT_CHARS) {
-            // Recent translations are the largest field. Keep dictionaries and summary first.
             try {
                 JSONArray recent = context.optJSONArray("recent_pages");
                 if (recent != null) {
@@ -67,11 +61,18 @@ public final class TranslationMemory {
                 json = context.toString();
             } catch (Exception ignored) {}
         }
-        if (json.length() > MAX_CONTEXT_CHARS) json = json.substring(0, MAX_CONTEXT_CHARS);
+        if (json.length() > MAX_CONTEXT_CHARS) {
+            try {
+                JSONObject compact = new JSONObject();
+                compact.put("characters", limitedObject(context.optJSONObject("characters"), 45));
+                compact.put("terms", limitedObject(context.optJSONObject("terms"), 80));
+                compact.put("honorifics", limitedObject(context.optJSONObject("honorifics"), 80));
+                json = compact.toString();
+            } catch (Exception ignored) {}
+        }
 
-        return "아래는 같은 폴더의 이전 페이지에서 확정된 번역 문맥입니다. "
-                + "이 정보를 최우선으로 지켜 이름, 고유명사, 존댓말/반말, 호칭을 통일하세요. "
-                + "기존 표기를 임의로 바꾸지 말고, 새 정보만 memory_updates에 추가하세요.\n"
+        return "같은 폴더의 확정 번역 규칙입니다. 이름, 고유명사, 존댓말/반말, 호칭을 반드시 그대로 유지하세요. "
+                + "새로 확실해진 정보만 memory_updates에 추가하고 기존 표기를 임의로 바꾸지 마세요.\n"
                 + json;
     }
 
@@ -79,12 +80,6 @@ public final class TranslationMemory {
         if (result == null) return;
         JSONObject updates = result.memoryUpdates;
         if (updates != null) {
-            String summary = firstNonEmpty(
-                    updates.optString("story_summary", ""),
-                    updates.optString("updated_story_summary", ""));
-            if (!summary.isEmpty()) {
-                try { root.put("story_summary", limit(summary, 5000)); } catch (Exception ignored) {}
-            }
             mergeObject(root.optJSONObject("characters"), updates.optJSONObject("characters"));
             mergeObject(root.optJSONObject("terms"), updates.optJSONObject("terms"));
             mergeObject(root.optJSONObject("honorifics"), updates.optJSONObject("honorifics"));
@@ -98,7 +93,6 @@ public final class TranslationMemory {
         JSONObject page = new JSONObject();
         try {
             page.put("page", pageName == null ? "" : pageName);
-            page.put("summary", limit(result.pageSummary, 1000));
             page.put("translation", limit(result.text, MAX_RECENT_TRANSLATION_CHARS));
             recent.put(page);
             while (recent.length() > MAX_RECENT_PAGES) recent.remove(0);
@@ -118,8 +112,9 @@ public final class TranslationMemory {
     }
 
     public synchronized String summaryPreview() {
-        String summary = root.optString("story_summary", "").trim();
-        return summary.isEmpty() ? "아직 누적 줄거리 없음" : limit(summary, 240);
+        JSONArray recent = root.optJSONArray("recent_pages");
+        int count = recent == null ? 0 : recent.length();
+        return count == 0 ? "최근 번역 문맥 없음" : "최근 번역 문맥 " + count + "페이지 유지";
     }
 
     public synchronized JSONObject copyRoot() {
@@ -151,8 +146,7 @@ public final class TranslationMemory {
     private static JSONObject createEmptyRoot() {
         JSONObject value = new JSONObject();
         try {
-            value.put("version", 1);
-            value.put("story_summary", "");
+            value.put("version", 2);
             value.put("characters", new JSONObject());
             value.put("terms", new JSONObject());
             value.put("honorifics", new JSONObject());
@@ -163,14 +157,50 @@ public final class TranslationMemory {
 
     private static JSONObject normalize(JSONObject value) {
         try {
-            if (!value.has("version")) value.put("version", 1);
-            if (!value.has("story_summary")) value.put("story_summary", "");
+            value.put("version", 2);
+            value.remove("story_summary");
+            value.remove("updated_story_summary");
             if (value.optJSONObject("characters") == null) value.put("characters", new JSONObject());
             if (value.optJSONObject("terms") == null) value.put("terms", new JSONObject());
             if (value.optJSONObject("honorifics") == null) value.put("honorifics", new JSONObject());
-            if (value.optJSONArray("recent_pages") == null) value.put("recent_pages", new JSONArray());
+            JSONArray recent = value.optJSONArray("recent_pages");
+            if (recent == null) {
+                recent = new JSONArray();
+                value.put("recent_pages", recent);
+            }
+            for (int i = 0; i < recent.length(); i++) {
+                JSONObject page = recent.optJSONObject(i);
+                if (page != null) page.remove("summary");
+            }
+            while (recent.length() > MAX_RECENT_PAGES) recent.remove(0);
         } catch (Exception ignored) {}
         return value;
+    }
+
+    private static JSONObject safeObject(JSONObject value) {
+        if (value == null) return new JSONObject();
+        try { return new JSONObject(value.toString()); }
+        catch (Exception ignored) { return new JSONObject(); }
+    }
+
+    private static JSONArray safeArray(JSONArray value) {
+        if (value == null) return new JSONArray();
+        try { return new JSONArray(value.toString()); }
+        catch (Exception ignored) { return new JSONArray(); }
+    }
+
+    private static JSONObject limitedObject(JSONObject source, int maxEntries) {
+        JSONObject result = new JSONObject();
+        if (source == null || maxEntries <= 0) return result;
+        Iterator<String> keys = source.keys();
+        int count = 0;
+        while (keys.hasNext() && count < maxEntries) {
+            String key = keys.next();
+            try { result.put(key, source.opt(key)); }
+            catch (Exception ignored) {}
+            count++;
+        }
+        return result;
     }
 
     private static void mergeObject(JSONObject destination, JSONObject updates) {
@@ -191,14 +221,6 @@ public final class TranslationMemory {
 
     private static int objectLength(JSONObject object) {
         return object == null ? 0 : object.length();
-    }
-
-    private static String firstNonEmpty(String... values) {
-        if (values == null) return "";
-        for (String value : values) {
-            if (value != null && !value.trim().isEmpty()) return value.trim();
-        }
-        return "";
     }
 
     private static String limit(String value, int max) {

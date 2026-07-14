@@ -16,6 +16,7 @@ import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.IOException;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
@@ -29,6 +30,8 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public final class TranslationClient {
     private static final String DEFAULT_SYSTEM_PROMPT =
@@ -37,23 +40,24 @@ public final class TranslationClient {
             "효과음, 작은 글씨, UI 문구도 가능한 한 빠뜨리지 마세요. 고유명사는 문맥에 맞게 일관되게 표기하세요.";
 
     private static final String STRUCTURED_OUTPUT_INSTRUCTION =
-            "번역 결과는 화면의 원문 위치 위에 표시해야 합니다. 반드시 마크다운 없이 유효한 JSON 객체 하나만 출력하세요. " +
+            "반드시 마크다운 없이 유효한 JSON 객체 하나만 출력하세요. " +
             "형식은 {\"blocks\":[{\"text\":\"한국어 번역\",\"x\":0,\"y\":0,\"width\":100,\"height\":100}]," +
-            "\"page_summary\":\"현재 페이지에서 일어난 일을 짧게 요약\"," +
-            "\"memory_updates\":{\"story_summary\":\"현재 페이지까지 반영한 짧은 누적 줄거리\"," +
-            "\"characters\":{\"원문 이름\":{\"korean_name\":\"통일 표기\",\"speech_style\":\"말투와 높임체\",\"role\":\"관계/역할\"}}," +
+            "\"memory_updates\":{\"characters\":{\"원문 이름\":{\"korean_name\":\"통일 표기\",\"speech_style\":\"말투와 높임체\",\"role\":\"관계/역할\"}}," +
             "\"terms\":{\"원문 고유명사\":\"통일 한국어 표기\"}," +
             "\"honorifics\":{\"화자→상대\":\"사용할 호칭\"}}} 입니다. " +
             "x, y, width, height는 원본 이미지 전체를 가로·세로 각각 0~1000으로 본 정수 좌표입니다. " +
-            "x,y는 원문 글자 영역의 왼쪽 위이고 width,height는 그 영역의 크기입니다. " +
-            "말풍선이나 문단별로 blocks를 나누고 읽는 순서를 유지하세요. text에는 번역문만 넣고 원문·설명·번호를 넣지 마세요. " +
-            "이전 문맥에 이미 확정된 이름, 고유명사, 높임체, 호칭이 있으면 반드시 그대로 사용하세요. " +
-            "memory_updates에는 새로 발견했거나 명확해진 정보만 넣고, 불확실하면 빈 객체를 사용하세요. " +
-            "story_summary는 과도하게 길지 않게 현재 페이지까지의 핵심 사건과 관계만 누적 요약하세요. " +
-            "번역할 외국어가 없으면 blocks는 빈 배열로 반환하되 page_summary와 확실한 memory_updates는 유지할 수 있습니다.";
+            "말풍선이나 문단별로 blocks를 나누고 읽는 순서를 유지하세요. text에는 번역문만 넣으세요. " +
+            "확정된 이름, 고유명사, 높임체, 호칭은 반드시 유지하고 memory_updates에는 새로 확실해진 정보만 넣으세요. " +
+            "번역할 외국어가 없으면 blocks는 빈 배열로 반환하세요.";
 
     private static final String USER_REQUEST =
-            "첨부한 이미지 안의 외국어 문구를 찾아 한국어로 번역하고, 기존 문맥과 용어집을 지켜 각 원문 위치의 좌표 및 문맥 업데이트와 함께 지정된 JSON 형식으로 반환해 주세요.";
+            "이미지 속 외국어를 한국어로 번역하고 원문 좌표와 필요한 문맥 업데이트를 지정된 JSON 형식으로 반환하세요.";
+
+    private static final int MAX_RATE_LIMIT_RETRIES = 5;
+    private static final long[] RATE_LIMIT_BACKOFF_MS = {5_000L, 10_000L, 20_000L, 40_000L, 60_000L};
+    private static final Pattern RETRY_DELAY_PATTERN = Pattern.compile(
+            "(?:retryDelay|retry_delay)[^0-9]{0,40}([0-9]+(?:\\.[0-9]+)?)s",
+            Pattern.CASE_INSENSITIVE);
 
     private static final Map<String, CachedToken> TOKEN_CACHE = new HashMap<>();
 
@@ -63,12 +67,18 @@ public final class TranslationClient {
 
     public static TranslationResult translate(ContentResolver resolver, Uri imageUri,
                                               ApiSettings settings, SecureStore secrets) throws Exception {
-        return translate(resolver, imageUri, settings, secrets, "");
+        return translate(resolver, imageUri, settings, secrets, "", null);
     }
 
     public static TranslationResult translate(ContentResolver resolver, Uri imageUri,
                                               ApiSettings settings, SecureStore secrets,
                                               String continuityContext) throws Exception {
+        return translate(resolver, imageUri, settings, secrets, continuityContext, null);
+    }
+
+    public static TranslationResult translate(ContentResolver resolver, Uri imageUri,
+                                              ApiSettings settings, SecureStore secrets,
+                                              String continuityContext, RetryListener retryListener) throws Exception {
         ImagePayload image = encodeImage(resolver, imageUri);
         String systemPrompt = settings.systemPrompt().trim().isEmpty()
                 ? DEFAULT_SYSTEM_PROMPT : settings.systemPrompt().trim();
@@ -79,17 +89,21 @@ public final class TranslationClient {
         }
         switch (settings.provider()) {
             case ApiSettings.OPENAI:
-                return translateOpenAi(image, structuredPrompt.toString(), settings, secrets.get("openai_key"));
+                return translateOpenAi(image, structuredPrompt.toString(), settings,
+                        secrets.get("openai_key"), retryListener);
             case ApiSettings.VERTEX:
-                return translateVertex(image, structuredPrompt.toString(), settings, secrets.get("vertex_json"));
+                return translateVertex(image, structuredPrompt.toString(), settings,
+                        secrets.get("vertex_json"), retryListener);
             case ApiSettings.GEMINI:
             default:
-                return translateGemini(image, structuredPrompt.toString(), settings, secrets.get("gemini_key"));
+                return translateGemini(image, structuredPrompt.toString(), settings,
+                        secrets.get("gemini_key"), retryListener);
         }
     }
 
     private static TranslationResult translateOpenAi(ImagePayload image, String systemPrompt,
-                                                     ApiSettings settings, String apiKey) throws Exception {
+                                                     ApiSettings settings, String apiKey,
+                                                     RetryListener retryListener) throws Exception {
         require(apiKey, "OpenAI API 키가 설정되지 않았습니다.");
         require(settings.openAiModel(), "OpenAI 모델명이 비어 있습니다.");
         require(settings.openAiEndpoint(), "OpenAI 엔드포인트가 비어 있습니다.");
@@ -97,7 +111,7 @@ public final class TranslationClient {
         JSONObject body = new JSONObject();
         body.put("model", settings.openAiModel());
         body.put("instructions", systemPrompt);
-        body.put("max_output_tokens", 5000);
+        body.put("max_output_tokens", 2500);
 
         JSONArray input = new JSONArray();
         JSONObject message = new JSONObject();
@@ -106,7 +120,7 @@ public final class TranslationClient {
         content.put(new JSONObject().put("type", "input_text").put("text", USER_REQUEST));
         content.put(new JSONObject()
                 .put("type", "input_image")
-                .put("detail", "high")
+                .put("detail", "auto")
                 .put("image_url", "data:" + image.mimeType + ";base64," + image.base64));
         message.put("content", content);
         input.put(message);
@@ -114,12 +128,12 @@ public final class TranslationClient {
 
         Map<String, String> headers = new HashMap<>();
         headers.put("Authorization", "Bearer " + apiKey.trim());
-        JSONObject response = postJson(settings.openAiEndpoint(), body, headers);
+        JSONObject response = postJson(settings.openAiEndpoint(), body, headers, retryListener);
 
         String rawText = parseOpenAiText(response);
         TokenUsage usage = parseOpenAiUsage(response);
         ParsedTranslation parsed = parseStructuredTranslation(rawText);
-        return new TranslationResult(parsed.text, usage, parsed.blocks, parsed.pageSummary, parsed.memoryUpdates);
+        return new TranslationResult(parsed.text, usage, parsed.blocks, parsed.memoryUpdates);
     }
 
     private static String parseOpenAiText(JSONObject response) {
@@ -163,7 +177,8 @@ public final class TranslationClient {
     }
 
     private static TranslationResult translateGemini(ImagePayload image, String systemPrompt,
-                                                     ApiSettings settings, String apiKey) throws Exception {
+                                                     ApiSettings settings, String apiKey,
+                                                     RetryListener retryListener) throws Exception {
         require(apiKey, "Gemini API 키가 설정되지 않았습니다.");
         require(settings.geminiModel(), "Gemini 모델명이 비어 있습니다.");
         String model = settings.geminiModel().replace("models/", "");
@@ -182,17 +197,18 @@ public final class TranslationClient {
                 .put("system_instruction", systemInstruction)
                 .put("contents", new JSONArray().put(new JSONObject().put("role", "user").put("parts", parts)))
                 .put("generationConfig", new JSONObject()
-                        .put("temperature", 0.2)
-                        .put("maxOutputTokens", 5000)
+                        .put("temperature", 0.1)
+                        .put("maxOutputTokens", 2500)
                         .put("responseMimeType", "application/json"));
         Map<String, String> headers = new HashMap<>();
         headers.put("x-goog-api-key", apiKey.trim());
-        JSONObject response = postJson(endpoint, body, headers);
+        JSONObject response = postJson(endpoint, body, headers, retryListener);
         return parseGeminiResult(response, "Gemini");
     }
 
     private static TranslationResult translateVertex(ImagePayload image, String systemPrompt,
-                                                     ApiSettings settings, String serviceJsonText) throws Exception {
+                                                     ApiSettings settings, String serviceJsonText,
+                                                     RetryListener retryListener) throws Exception {
         require(serviceJsonText, "Vertex AI 서비스 계정 JSON을 불러오지 않았습니다.");
         require(settings.vertexModel(), "Vertex AI 모델명이 비어 있습니다.");
         JSONObject service = new JSONObject(serviceJsonText);
@@ -223,12 +239,12 @@ public final class TranslationClient {
                 .put("systemInstruction", systemInstruction)
                 .put("contents", new JSONArray().put(new JSONObject().put("role", "user").put("parts", parts)))
                 .put("generationConfig", new JSONObject()
-                        .put("temperature", 0.2)
-                        .put("maxOutputTokens", 5000)
+                        .put("temperature", 0.1)
+                        .put("maxOutputTokens", 2500)
                         .put("responseMimeType", "application/json"));
         Map<String, String> headers = new HashMap<>();
         headers.put("Authorization", "Bearer " + token);
-        JSONObject response = postJson(endpoint, body, headers);
+        JSONObject response = postJson(endpoint, body, headers, retryListener);
         return parseGeminiResult(response, "Vertex AI");
     }
 
@@ -265,14 +281,13 @@ public final class TranslationClient {
             tokenUsage = new TokenUsage(input, output, total, reasoning);
         }
         ParsedTranslation parsed = parseStructuredTranslation(result.toString().trim());
-        return new TranslationResult(parsed.text, tokenUsage, parsed.blocks, parsed.pageSummary, parsed.memoryUpdates);
+        return new TranslationResult(parsed.text, tokenUsage, parsed.blocks, parsed.memoryUpdates);
     }
 
     private static ParsedTranslation parseStructuredTranslation(String rawText) {
         String clean = stripCodeFence(rawText == null ? "" : rawText.trim());
         List<TranslationBlock> blocks = new ArrayList<>();
         List<String> unplacedTexts = new ArrayList<>();
-        String pageSummary = "";
         JSONObject memoryUpdates = new JSONObject();
         JSONObject rootObject = null;
         try {
@@ -284,8 +299,6 @@ public final class TranslationClient {
                 int end = clean.lastIndexOf('}');
                 if (start < 0 || end <= start) throw new IllegalArgumentException("JSON 객체 없음");
                 rootObject = new JSONObject(clean.substring(start, end + 1));
-                pageSummary = firstNonEmpty(rootObject.optString("page_summary", ""),
-                        rootObject.optString("summary", "")).trim();
                 JSONObject updates = rootObject.optJSONObject("memory_updates");
                 if (updates != null) memoryUpdates = updates;
                 values = rootObject.optJSONArray("blocks");
@@ -383,7 +396,7 @@ public final class TranslationClient {
             combined.append(block.text);
         }
         String text = combined.length() == 0 ? "[번역할 텍스트 없음]" : combined.toString();
-        return new ParsedTranslation(text, blocks, pageSummary, memoryUpdates);
+        return new ParsedTranslation(text, blocks, memoryUpdates);
     }
 
     private static String stripCodeFence(String value) {
@@ -415,13 +428,10 @@ public final class TranslationClient {
     private static final class ParsedTranslation {
         final String text;
         final List<TranslationBlock> blocks;
-        final String pageSummary;
         final JSONObject memoryUpdates;
-        ParsedTranslation(String text, List<TranslationBlock> blocks,
-                          String pageSummary, JSONObject memoryUpdates) {
+        ParsedTranslation(String text, List<TranslationBlock> blocks, JSONObject memoryUpdates) {
             this.text = text;
             this.blocks = blocks;
-            this.pageSummary = pageSummary == null ? "" : pageSummary;
             this.memoryUpdates = memoryUpdates == null ? new JSONObject() : memoryUpdates;
         }
     }
@@ -472,8 +482,8 @@ public final class TranslationClient {
         Bitmap decoded = ImageDecoder.decodeBitmap(source, (decoder, info, src) -> {
             Size size = info.getSize();
             int max = Math.max(size.getWidth(), size.getHeight());
-            if (max > 2048) {
-                float ratio = 2048f / max;
+            if (max > 1600) {
+                float ratio = 1600f / max;
                 decoder.setTargetSize(Math.max(1, Math.round(size.getWidth() * ratio)),
                         Math.max(1, Math.round(size.getHeight() * ratio)));
             }
@@ -487,7 +497,7 @@ public final class TranslationClient {
             canvas.drawBitmap(decoded, 0, 0, null);
         }
         ByteArrayOutputStream output = new ByteArrayOutputStream();
-        if (!rgb.compress(Bitmap.CompressFormat.JPEG, 88, output)) {
+        if (!rgb.compress(Bitmap.CompressFormat.JPEG, 82, output)) {
             throw new IllegalStateException("이미지를 JPEG로 변환하지 못했습니다.");
         }
         if (rgb != decoded) rgb.recycle();
@@ -496,42 +506,116 @@ public final class TranslationClient {
     }
 
     private static JSONObject postJson(String endpoint, JSONObject body,
-                                       Map<String, String> headers) throws Exception {
+                                       Map<String, String> headers, RetryListener retryListener) throws Exception {
         return request(endpoint, "application/json; charset=utf-8",
-                body.toString().getBytes(StandardCharsets.UTF_8), headers);
+                body.toString().getBytes(StandardCharsets.UTF_8), headers, retryListener, true);
     }
 
     private static JSONObject postForm(String endpoint, String body) throws Exception {
         return request(endpoint, "application/x-www-form-urlencoded; charset=utf-8",
-                body.getBytes(StandardCharsets.UTF_8), new HashMap<>());
+                body.getBytes(StandardCharsets.UTF_8), new HashMap<>(), null, false);
     }
 
     private static JSONObject request(String endpoint, String contentType, byte[] body,
-                                      Map<String, String> headers) throws Exception {
-        HttpURLConnection connection = (HttpURLConnection) new URL(endpoint).openConnection();
-        connection.setRequestMethod("POST");
-        connection.setConnectTimeout(30_000);
-        connection.setReadTimeout(120_000);
-        connection.setDoOutput(true);
-        connection.setRequestProperty("Content-Type", contentType);
-        connection.setRequestProperty("Accept", "application/json");
-        connection.setRequestProperty("User-Agent", "ImageLingo/0.8 Android");
-        for (Map.Entry<String, String> entry : headers.entrySet()) {
-            connection.setRequestProperty(entry.getKey(), entry.getValue());
+                                      Map<String, String> headers, RetryListener retryListener,
+                                      boolean retryRateLimit) throws Exception {
+        int retryAttempt = 0;
+        while (true) {
+            if (retryListener != null && retryListener.isCancelled()) {
+                throw new TranslationCancelledException();
+            }
+            HttpURLConnection connection = (HttpURLConnection) new URL(endpoint).openConnection();
+            connection.setRequestMethod("POST");
+            connection.setConnectTimeout(25_000);
+            connection.setReadTimeout(90_000);
+            connection.setDoOutput(true);
+            connection.setRequestProperty("Content-Type", contentType);
+            connection.setRequestProperty("Accept", "application/json");
+            connection.setRequestProperty("User-Agent", "ImageLingo/0.9 Android");
+            for (Map.Entry<String, String> entry : headers.entrySet()) {
+                connection.setRequestProperty(entry.getKey(), entry.getValue());
+            }
+            connection.setFixedLengthStreamingMode(body.length);
+            try (OutputStream output = connection.getOutputStream()) {
+                output.write(body);
+            }
+            int code = connection.getResponseCode();
+            String retryAfterHeader = connection.getHeaderField("Retry-After");
+            InputStream stream = code >= 200 && code < 300
+                    ? connection.getInputStream() : connection.getErrorStream();
+            String responseText = readAll(stream);
+            connection.disconnect();
+
+            if (code >= 200 && code < 300) return new JSONObject(responseText);
+            String errorMessage = extractError(responseText);
+            if (code != 429 || !retryRateLimit) {
+                throw new IllegalStateException("HTTP " + code + ": " + errorMessage);
+            }
+            if (isNonRecoverableQuotaError(errorMessage + " " + responseText)) {
+                throw new RateLimitException(errorMessage, retryAttempt);
+            }
+            if (retryAttempt >= MAX_RATE_LIMIT_RETRIES) {
+                throw new RateLimitException(errorMessage, retryAttempt);
+            }
+
+            long backoff = RATE_LIMIT_BACKOFF_MS[Math.min(retryAttempt, RATE_LIMIT_BACKOFF_MS.length - 1)];
+            long retryAfter = Math.max(parseRetryAfterMillis(retryAfterHeader),
+                    parseRetryDelayFromBody(responseText));
+            long delayMs = Math.max(backoff, retryAfter);
+            retryAttempt++;
+            waitForRetry(delayMs, retryAttempt, retryListener, errorMessage);
         }
-        connection.setFixedLengthStreamingMode(body.length);
-        try (OutputStream output = connection.getOutputStream()) {
-            output.write(body);
+    }
+
+    private static void waitForRetry(long delayMs, int attempt, RetryListener listener,
+                                     String message) throws Exception {
+        long remaining = Math.max(1_000L, Math.min(delayMs, 120_000L));
+        while (remaining > 0L) {
+            if (listener != null && listener.isCancelled()) throw new TranslationCancelledException();
+            long seconds = Math.max(1L, (remaining + 999L) / 1000L);
+            if (listener != null) {
+                listener.onRateLimitRetry(attempt, MAX_RATE_LIMIT_RETRIES, seconds, message);
+            }
+            long sleep = Math.min(1_000L, remaining);
+            try { Thread.sleep(sleep); }
+            catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new TranslationCancelledException();
+            }
+            remaining -= sleep;
         }
-        int code = connection.getResponseCode();
-        InputStream stream = code >= 200 && code < 300
-                ? connection.getInputStream() : connection.getErrorStream();
-        String responseText = readAll(stream);
-        connection.disconnect();
-        if (code < 200 || code >= 300) {
-            throw new IllegalStateException("HTTP " + code + ": " + extractError(responseText));
+    }
+
+    private static boolean isNonRecoverableQuotaError(String message) {
+        if (message == null) return false;
+        String lower = message.toLowerCase();
+        return lower.contains("insufficient_quota")
+                || lower.contains("check your plan")
+                || lower.contains("billing details")
+                || lower.contains("credit balance")
+                || lower.contains("payment required");
+    }
+
+    private static long parseRetryAfterMillis(String value) {
+        if (value == null || value.trim().isEmpty()) return 0L;
+        try {
+            double seconds = Double.parseDouble(value.trim());
+            return Math.max(0L, Math.round(seconds * 1000d));
+        } catch (Exception ignored) {
+            return 0L;
         }
-        return new JSONObject(responseText);
+    }
+
+    private static long parseRetryDelayFromBody(String body) {
+        if (body == null || body.isEmpty()) return 0L;
+        Matcher matcher = RETRY_DELAY_PATTERN.matcher(body);
+        if (!matcher.find()) return 0L;
+        try {
+            double seconds = Double.parseDouble(matcher.group(1));
+            return Math.max(0L, Math.round(seconds * 1000d));
+        } catch (Exception ignored) {
+            return 0L;
+        }
     }
 
     private static String readAll(InputStream stream) throws Exception {
@@ -572,19 +656,35 @@ public final class TranslationClient {
         if (value == null || value.trim().isEmpty()) throw new IllegalStateException(message);
     }
 
+    public interface RetryListener {
+        void onRateLimitRetry(int attempt, int maxRetries, long remainingSeconds, String message);
+        boolean isCancelled();
+    }
+
+    public static final class RateLimitException extends IOException {
+        public final int retryCount;
+        RateLimitException(String message, int retryCount) {
+            super(message == null || message.trim().isEmpty()
+                    ? "API 사용량 제한(429)에 도달했습니다." : message);
+            this.retryCount = retryCount;
+        }
+    }
+
+    public static final class TranslationCancelledException extends IOException {
+        TranslationCancelledException() { super("번역이 중지되었습니다."); }
+    }
+
     public static final class TranslationResult {
         public final String text;
         public final TokenUsage usage;
         public final List<TranslationBlock> blocks;
-        public final String pageSummary;
         public final JSONObject memoryUpdates;
 
         TranslationResult(String text, TokenUsage usage, List<TranslationBlock> blocks,
-                          String pageSummary, JSONObject memoryUpdates) {
+                          JSONObject memoryUpdates) {
             this.text = text == null ? "" : text;
             this.usage = usage == null ? TokenUsage.unavailable() : usage;
             this.blocks = blocks == null ? new ArrayList<>() : new ArrayList<>(blocks);
-            this.pageSummary = pageSummary == null ? "" : pageSummary;
             try {
                 this.memoryUpdates = memoryUpdates == null
                         ? new JSONObject() : new JSONObject(memoryUpdates.toString());

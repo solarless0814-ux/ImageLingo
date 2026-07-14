@@ -94,6 +94,9 @@ public final class MainActivity extends Activity {
     private volatile int processingPageNumber;
     private volatile TranslationMemory translationMemory;
     private volatile Uri outputDirectoryUri;
+    private final Object rateLimitPauseLock = new Object();
+    private volatile boolean rateLimitPaused;
+    private volatile String rateLimitPauseMessage = "";
     private boolean translatedOnlyMode;
     private String currentTranslationText = "";
 
@@ -201,7 +204,10 @@ public final class MainActivity extends Activity {
         Button previous = makeNavButton("〈  이전");
         previous.setOnClickListener(v -> movePage(-1));
         translateButton = makePrimaryButton("폴더 번역");
-        translateButton.setOnClickListener(v -> translateFolder());
+        translateButton.setOnClickListener(v -> {
+            if (rateLimitPaused) resumeRateLimitPause();
+            else translateFolder();
+        });
         Button next = makeNavButton("다음  〉");
         next.setOnClickListener(v -> movePage(1));
 
@@ -651,8 +657,8 @@ public final class MainActivity extends Activity {
         return ImageDecoder.decodeBitmap(source, (decoder, info, src) -> {
             Size size = info.getSize();
             int max = Math.max(size.getWidth(), size.getHeight());
-            if (max > 4096) {
-                float ratio = 4096f / max;
+            if (max > 3072) {
+                float ratio = 3072f / max;
                 decoder.setTargetSize(Math.max(1, Math.round(size.getWidth() * ratio)),
                         Math.max(1, Math.round(size.getHeight() * ratio)));
             }
@@ -680,6 +686,8 @@ public final class MainActivity extends Activity {
         }
         batchRunning = true;
         batchStopRequested = false;
+        rateLimitPaused = false;
+        rateLimitPauseMessage = "";
         processingImageUri = null;
         processingPageNumber = 0;
         imageLoadVersion.incrementAndGet();
@@ -710,9 +718,99 @@ public final class MainActivity extends Activity {
     private void requestStopBatch() {
         if (!batchRunning || batchStopRequested) return;
         batchStopRequested = true;
+        synchronized (rateLimitPauseLock) {
+            rateLimitPaused = false;
+            rateLimitPauseLock.notifyAll();
+        }
         stopButton.setEnabled(false);
         stopButton.setText("중지 요청됨");
-        Toast.makeText(this, "현재 처리 중인 이미지를 마치면 중지합니다.", Toast.LENGTH_SHORT).show();
+        Toast.makeText(this, "현재 요청을 마치거나 재시도 대기에서 빠져나온 뒤 중지합니다.", Toast.LENGTH_SHORT).show();
+    }
+
+    private TranslationClient.TranslationResult translateWithRateLimitRecovery(
+            ImageRepository.ImageEntry entry, String continuityContext, int pageNumber, int totalPages)
+            throws Exception {
+        TranslationClient.RetryListener listener = new TranslationClient.RetryListener() {
+            @Override public void onRateLimitRetry(int attempt, int maxRetries, long remainingSeconds,
+                                                   String message) {
+                runOnUiThread(() -> showRateLimitRetry(pageNumber, totalPages, attempt,
+                        maxRetries, remainingSeconds, message));
+            }
+
+            @Override public boolean isCancelled() {
+                return batchStopRequested;
+            }
+        };
+
+        while (!batchStopRequested) {
+            try {
+                return TranslationClient.translate(getContentResolver(), entry.uri, apiSettings,
+                        secureStore, continuityContext, listener);
+            } catch (TranslationClient.RateLimitException rateLimit) {
+                if (!pauseForRateLimitAndWait(pageNumber, totalPages, rateLimit)) {
+                    throw new TranslationClient.TranslationCancelledException();
+                }
+            }
+        }
+        throw new TranslationClient.TranslationCancelledException();
+    }
+
+    private boolean pauseForRateLimitAndWait(int pageNumber, int totalPages,
+                                             TranslationClient.RateLimitException error) {
+        rateLimitPauseMessage = cleanMessage(error);
+        synchronized (rateLimitPauseLock) {
+            rateLimitPaused = true;
+        }
+        runOnUiThread(() -> {
+            translateButton.setEnabled(true);
+            translateButton.setText("계속하기");
+            translateButton.setAlpha(1f);
+            tokenBadge.setText("429 자동 재시도 한도 도달 · 일시정지\n"
+                    + pageNumber + "/" + totalPages + "페이지 · 설정/한도 확인 후 계속하기");
+            tokenBadge.setVisibility(View.VISIBLE);
+            tokenBadge.bringToFront();
+            Toast.makeText(this, "429 제한으로 일시정지했습니다. 한도를 확인한 뒤 계속하기를 누르세요.",
+                    Toast.LENGTH_LONG).show();
+        });
+
+        synchronized (rateLimitPauseLock) {
+            while (rateLimitPaused && !batchStopRequested) {
+                try { rateLimitPauseLock.wait(); }
+                catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+            }
+        }
+        return !batchStopRequested;
+    }
+
+    private void resumeRateLimitPause() {
+        if (!batchRunning || !rateLimitPaused) return;
+        synchronized (rateLimitPauseLock) {
+            rateLimitPaused = false;
+            rateLimitPauseLock.notifyAll();
+        }
+        translateButton.setEnabled(false);
+        translateButton.setText("폴더 번역 중…");
+        translateButton.setAlpha(0.75f);
+        tokenBadge.setText("429 일시정지 해제 · 같은 페이지 다시 시도 중");
+        tokenBadge.setVisibility(View.VISIBLE);
+    }
+
+    private void showRateLimitRetry(int pageNumber, int totalPages, int attempt,
+                                    int maxRetries, long remainingSeconds, String message) {
+        if (!batchRunning || batchStopRequested || rateLimitPaused) return;
+        String clean = message == null ? "" : message.trim();
+        if (clean.length() > 80) clean = clean.substring(0, 80) + "…";
+        StringBuilder value = new StringBuilder();
+        value.append("429 제한 · ").append(remainingSeconds).append("초 후 자동 재시도")
+                .append(" (").append(attempt).append("/").append(maxRetries).append(")")
+                .append("\n").append(pageNumber).append("/").append(totalPages).append("페이지");
+        if (!clean.isEmpty()) value.append(" · ").append(clean);
+        tokenBadge.setText(value.toString());
+        tokenBadge.setVisibility(View.VISIBLE);
+        tokenBadge.bringToFront();
     }
 
     private void runFolderTranslation(List<ImageRepository.ImageEntry> snapshot, Uri treeUri, String pinnedUri) {
@@ -775,8 +873,8 @@ public final class MainActivity extends Activity {
 
                     String key = cacheKeyFor(entry);
                     String continuityContext = memory.buildContextPrompt();
-                    TranslationClient.TranslationResult result = TranslationClient.translate(
-                            getContentResolver(), entry.uri, apiSettings, secureStore, continuityContext);
+                    TranslationClient.TranslationResult result = translateWithRateLimitRecovery(
+                            entry, continuityContext, displayIndex + 1, snapshot.size());
                     translationCache.put(key, result);
 
                     Bitmap source = decodeForDisplay(entry.uri);
@@ -814,6 +912,9 @@ public final class MainActivity extends Activity {
                                 fSuccess, fFailure, fCache, fSkipped, fUsage, fInput, fOutput, fTotal);
                         refreshLiveView(currentVisibleUri(), entry.uri.toString());
                     });
+                } catch (TranslationClient.TranslationCancelledException cancelled) {
+                    stopped = true;
+                    break;
                 } catch (Exception imageError) {
                     failureCount++;
                     failures.add(entry.name + "\n• " + cleanMessage(imageError));
@@ -909,6 +1010,11 @@ public final class MainActivity extends Activity {
     private void finishBatchUi() {
         batchRunning = false;
         batchStopRequested = false;
+        synchronized (rateLimitPauseLock) {
+            rateLimitPaused = false;
+            rateLimitPauseMessage = "";
+            rateLimitPauseLock.notifyAll();
+        }
         processingImageUri = null;
         processingPageNumber = 0;
         progressBar.setVisibility(View.GONE);
@@ -971,8 +1077,8 @@ public final class MainActivity extends Activity {
     }
 
     private void showSettingsDialog() {
-        if (batchRunning) {
-            Toast.makeText(this, "폴더 번역이 끝난 뒤 설정을 바꿔 주세요.", Toast.LENGTH_SHORT).show();
+        if (batchRunning && !rateLimitPaused) {
+            Toast.makeText(this, "번역 중에는 설정을 바꿀 수 없습니다. 429 일시정지 상태에서는 변경할 수 있습니다.", Toast.LENGTH_SHORT).show();
             return;
         }
         ScrollView scroll = new ScrollView(this);
@@ -1048,7 +1154,7 @@ public final class MainActivity extends Activity {
                 + " · 호칭 " + currentMemory.honorificCount() + "\n" + currentMemory.summaryPreview();
         TextView memoryStatus = caption(memoryDescription);
         form.addView(memoryStatus, matchWrap());
-        Button viewMemory = makeDialogButton("현재 문맥 요약 보기");
+        Button viewMemory = makeDialogButton("현재 문맥 규칙 보기");
         viewMemory.setOnClickListener(v -> showTranslationMemoryDialog());
         form.addView(viewMemory, fieldParams());
         Button resetMemory = makeDialogButton("현재 폴더 문맥 초기화");
@@ -1073,12 +1179,19 @@ public final class MainActivity extends Activity {
                         vertexLocation.getText().toString(), vertexProject.getText().toString(),
                         systemPrompt.getText().toString());
                 translationCache.clear();
-                tokenBadge.setVisibility(View.GONE);
-                copyButton.setVisibility(View.GONE);
-                stopButton.setVisibility(View.GONE);
-                currentTranslationText = "";
-                if (currentIndex >= 0) {
-                    renderCurrent();
+                if (batchRunning && rateLimitPaused) {
+                    tokenBadge.setText("설정 저장 완료 · 계속하기를 누르면 같은 페이지부터 재시도합니다.");
+                    tokenBadge.setVisibility(View.VISIBLE);
+                    stopButton.setVisibility(View.VISIBLE);
+                    translateButton.setEnabled(true);
+                    translateButton.setText("계속하기");
+                    translateButton.setAlpha(1f);
+                } else {
+                    tokenBadge.setVisibility(View.GONE);
+                    copyButton.setVisibility(View.GONE);
+                    stopButton.setVisibility(View.GONE);
+                    currentTranslationText = "";
+                    if (currentIndex >= 0) renderCurrent();
                 }
                 Toast.makeText(this, "설정을 저장했습니다.", Toast.LENGTH_SHORT).show();
                 dialog.dismiss();
@@ -1117,7 +1230,7 @@ public final class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         AlertDialog dialog = new AlertDialog.Builder(this)
                 .setTitle("현재 폴더 문맥 편집")
-                .setMessage("characters, terms, honorifics 값을 수정하면 다음 페이지부터 통일 규칙에 반영됩니다.")
+                .setMessage("characters, terms, honorifics 값을 수정하면 다음 페이지부터 통일 규칙에 반영됩니다. 줄거리 요약은 사용하지 않습니다.")
                 .setView(scroll)
                 .setNegativeButton("취소", null)
                 .setPositiveButton("저장", null)
@@ -1156,7 +1269,7 @@ public final class MainActivity extends Activity {
         }
         new AlertDialog.Builder(this)
                 .setTitle("문맥 메모리 초기화")
-                .setMessage("저장된 이름, 고유명사, 높임체, 호칭과 줄거리 요약을 모두 지울까요? 번역 이미지 파일은 삭제되지 않습니다.")
+                .setMessage("저장된 이름, 고유명사, 높임체, 호칭과 최근 번역 문맥을 모두 지울까요? 번역 이미지 파일은 삭제되지 않습니다.")
                 .setNegativeButton("취소", null)
                 .setPositiveButton("초기화", (dialog, which) -> executor.execute(() -> {
                     try {
@@ -1168,7 +1281,7 @@ public final class MainActivity extends Activity {
                         outputDirectoryUri = target;
                         translationCache.clear();
                         runOnUiThread(() -> {
-                            statusView.setText("인물 0 · 용어 0 · 호칭 0\n아직 누적 줄거리 없음");
+                            statusView.setText("인물 0 · 용어 0 · 호칭 0\n최근 번역 문맥 없음");
                             updateTopProgress(processingPageNumber);
                             Toast.makeText(this, "문맥 메모리를 초기화했습니다.", Toast.LENGTH_SHORT).show();
                         });

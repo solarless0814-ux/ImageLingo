@@ -9,6 +9,7 @@ import android.text.Layout;
 import android.text.StaticLayout;
 import android.text.TextPaint;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /** Flattens translated text blocks into a single bitmap. */
@@ -31,20 +32,21 @@ public final class TranslatedImageRenderer {
         float minDim = Math.max(1f, Math.min(width, height));
 
         Paint bubblePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        bubblePaint.setColor(0xE8FFFFFF);
+        bubblePaint.setColor(0xFAFFFFFF);
         bubblePaint.setStyle(Paint.Style.FILL);
-        bubblePaint.setShadowLayer(minDim * 0.012f, 0f, minDim * 0.0035f, 0x55000000);
+        bubblePaint.setShadowLayer(minDim * 0.012f, 0f, minDim * 0.0035f, 0x66000000);
 
         Paint borderPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        borderPaint.setColor(0x9A2E333D);
+        borderPaint.setColor(0xD02A303A);
         borderPaint.setStyle(Paint.Style.STROKE);
-        borderPaint.setStrokeWidth(Math.max(1.5f, minDim * 0.0024f));
+        borderPaint.setStrokeWidth(Math.max(1.5f, minDim * 0.0028f));
 
         TextPaint textPaint = new TextPaint(Paint.ANTI_ALIAS_FLAG | Paint.SUBPIXEL_TEXT_FLAG);
-        textPaint.setColor(0xFF0F1217);
+        textPaint.setColor(0xFF090B0F);
         textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
 
         RectF imageBounds = new RectF(0f, 0f, width, height);
+        List<PreparedBlock> prepared = new ArrayList<>();
         for (TranslationClient.TranslationBlock block : blocks) {
             if (block == null || block.text == null || block.text.trim().isEmpty()) continue;
             RectF sourceRect = new RectF(
@@ -52,13 +54,29 @@ public final class TranslatedImageRenderer {
                     block.y / 1000f * height,
                     (block.x + block.width) / 1000f * width,
                     (block.y + block.height) / 1000f * height);
-            drawBlock(canvas, imageBounds, sourceRect, block.text.trim(), bubblePaint, borderPaint, textPaint);
+            PreparedBlock value = prepareBlock(imageBounds, sourceRect, block.text.trim(), textPaint);
+            if (value != null) prepared.add(value);
+        }
+
+        // Draw every background first. A later bubble can no longer hide text from an earlier bubble.
+        for (PreparedBlock block : prepared) {
+            canvas.drawRoundRect(block.bubble, block.radius, block.radius, bubblePaint);
+            canvas.drawRoundRect(block.bubble, block.radius, block.radius, borderPaint);
+        }
+        for (PreparedBlock block : prepared) {
+            textPaint.setTextSize(block.textSize);
+            StaticLayout layout = makeLayout(block.text, textPaint, block.textWidth);
+            canvas.save();
+            canvas.clipRect(block.bubble);
+            canvas.translate(block.bubble.left + block.horizontalPadding, block.textTop(layout));
+            layout.draw(canvas);
+            canvas.restore();
         }
         return output;
     }
 
-    private static void drawBlock(Canvas canvas, RectF imageBounds, RectF detectedRect, String text,
-                                  Paint bubblePaint, Paint borderPaint, TextPaint textPaint) {
+    private static PreparedBlock prepareBlock(RectF imageBounds, RectF detectedRect, String text,
+                                              TextPaint textPaint) {
         float width = imageBounds.width();
         float height = imageBounds.height();
         float minDim = Math.max(1f, Math.min(width, height));
@@ -82,12 +100,16 @@ public final class TranslatedImageRenderer {
 
         int textWidth = Math.max(1, Math.round(bubble.width() - horizontalPadding * 2f));
         float minTextSize = Math.max(14f, minDim * 0.018f);
-        float maxTextSize = Math.min(minDim * 0.085f, Math.max(minDim * 0.028f, detectedRect.height() * 0.50f));
-        StaticLayout layout = fitLayout(text, textPaint, textWidth,
+        float maxTextSize = Math.min(minDim * 0.085f,
+                Math.max(minDim * 0.028f, detectedRect.height() * 0.50f));
+        float textSize = fitTextSize(text, textPaint, textWidth,
                 Math.max(1, Math.round(bubble.height() - verticalPadding * 2f)), minTextSize, maxTextSize);
+        textPaint.setTextSize(textSize);
+        StaticLayout layout = makeLayout(text, textPaint, textWidth);
 
         if (layout.getHeight() > bubble.height() - verticalPadding * 2f) {
-            textPaint.setTextSize(minTextSize);
+            textSize = minTextSize;
+            textPaint.setTextSize(textSize);
             layout = makeLayout(text, textPaint, textWidth);
             float neededHeight = layout.getHeight() + verticalPadding * 2f;
             if (neededHeight > bubble.height()) {
@@ -97,38 +119,22 @@ public final class TranslatedImageRenderer {
         }
 
         float radius = Math.min(minDim * 0.028f, Math.min(bubble.width(), bubble.height()) * 0.22f);
-        canvas.drawRoundRect(bubble, radius, radius, bubblePaint);
-        canvas.drawRoundRect(bubble, radius, radius, borderPaint);
-
-        float textTop = bubble.top + Math.max(verticalPadding,
-                (bubble.height() - layout.getHeight()) * 0.5f);
-        canvas.save();
-        canvas.clipRect(bubble);
-        canvas.translate(bubble.left + horizontalPadding, textTop);
-        layout.draw(canvas);
-        canvas.restore();
+        return new PreparedBlock(text, bubble, textWidth, textSize,
+                horizontalPadding, verticalPadding, radius);
     }
 
-    private static StaticLayout fitLayout(String text, TextPaint textPaint, int width, int height,
-                                          float minSize, float maxSize) {
+    private static float fitTextSize(String text, TextPaint textPaint, int width, int height,
+                                     float minSize, float maxSize) {
         float low = minSize;
         float high = Math.max(minSize, maxSize);
-        StaticLayout best;
-        textPaint.setTextSize(low);
-        best = makeLayout(text, textPaint, width);
         for (int i = 0; i < 10; i++) {
             float mid = (low + high) * 0.5f;
             textPaint.setTextSize(mid);
             StaticLayout candidate = makeLayout(text, textPaint, width);
-            if (candidate.getHeight() <= height) {
-                best = candidate;
-                low = mid;
-            } else {
-                high = mid;
-            }
+            if (candidate.getHeight() <= height) low = mid;
+            else high = mid;
         }
-        textPaint.setTextSize(low);
-        return best;
+        return low;
     }
 
     private static StaticLayout makeLayout(String text, TextPaint paint, int width) {
@@ -165,6 +171,32 @@ public final class TranslatedImageRenderer {
         } else {
             if (rect.top < topLimit) rect.offset(0f, topLimit - rect.top);
             if (rect.bottom > bottomLimit) rect.offset(0f, bottomLimit - rect.bottom);
+        }
+    }
+
+    private static final class PreparedBlock {
+        final String text;
+        final RectF bubble;
+        final int textWidth;
+        final float textSize;
+        final float horizontalPadding;
+        final float verticalPadding;
+        final float radius;
+
+        PreparedBlock(String text, RectF bubble, int textWidth, float textSize,
+                      float horizontalPadding, float verticalPadding, float radius) {
+            this.text = text;
+            this.bubble = bubble;
+            this.textWidth = textWidth;
+            this.textSize = textSize;
+            this.horizontalPadding = horizontalPadding;
+            this.verticalPadding = verticalPadding;
+            this.radius = radius;
+        }
+
+        float textTop(StaticLayout layout) {
+            return bubble.top + Math.max(verticalPadding,
+                    (bubble.height() - layout.getHeight()) * 0.5f);
         }
     }
 }
