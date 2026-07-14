@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.1
+
+- 0.6 업데이트 패키지에서 누락된 `TranslatedImageRenderer.java` 복구
+- `cannot find symbol TranslatedImageRenderer` 빌드 오류 수정
+- 앱 버전 0.6.1로 상향
+
 ## 0.6.0
 
 - 상단 실시간 번역 완료 페이지/전체 페이지/퍼센트 표시 추가

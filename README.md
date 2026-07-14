@@ -1,6 +1,13 @@
-# ImageLingo 0.6
+# ImageLingo 0.6.1
 
 이미지 폴더 전체를 Gemini, OpenAI 또는 Vertex AI로 순차 번역하고, 원문 위에 반투명 박스와 한국어 번역문을 합성한 PNG 파일로 저장하는 개인용 Android 앱입니다.
+
+
+## 0.6.1 핫픽스
+
+- 0.6 업데이트 ZIP에서 누락된 `TranslatedImageRenderer.java` 복구
+- GitHub Actions의 `cannot find symbol TranslatedImageRenderer` 컴파일 오류 수정
+- 앱 버전 0.6.1로 상향
 
 ## 0.6 업데이트
 
