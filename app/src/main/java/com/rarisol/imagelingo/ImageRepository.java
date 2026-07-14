@@ -6,7 +6,11 @@ import android.graphics.Bitmap;
 import android.net.Uri;
 import android.provider.DocumentsContract;
 
+import java.io.BufferedReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -99,6 +103,42 @@ public final class ImageRepository {
     public static Uri findChildDocumentByName(ContentResolver resolver, Uri parentDocumentUri,
                                               String displayName) throws Exception {
         return findChildDocument(resolver, parentDocumentUri, displayName, null);
+    }
+
+    public static String readTextDocument(ContentResolver resolver, Uri documentUri,
+                                          int maxCharacters) throws Exception {
+        StringBuilder result = new StringBuilder();
+        try (InputStream input = resolver.openInputStream(documentUri);
+             BufferedReader reader = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8))) {
+            char[] buffer = new char[4096];
+            int read;
+            while ((read = reader.read(buffer)) >= 0) {
+                result.append(buffer, 0, read);
+                if (result.length() > maxCharacters) {
+                    throw new IllegalArgumentException("텍스트 파일이 너무 큽니다.");
+                }
+            }
+        }
+        return result.toString();
+    }
+
+    public static Uri saveTextDocument(ContentResolver resolver, Uri directoryUri,
+                                       String displayName, String mimeType, String text) throws Exception {
+        if (directoryUri == null) throw new IllegalArgumentException("directoryUri == null");
+        Uri existing = findChildDocument(resolver, directoryUri, displayName, null);
+        if (existing != null) {
+            try { DocumentsContract.deleteDocument(resolver, existing); }
+            catch (Exception ignored) {}
+        }
+        Uri created = DocumentsContract.createDocument(resolver, directoryUri,
+                mimeType == null || mimeType.isEmpty() ? "text/plain" : mimeType, displayName);
+        if (created == null) throw new IllegalStateException("텍스트 파일을 만들지 못했습니다: " + displayName);
+        try (OutputStream output = resolver.openOutputStream(created, "w")) {
+            if (output == null) throw new IllegalStateException("출력 스트림을 열 수 없습니다.");
+            output.write((text == null ? "" : text).getBytes(StandardCharsets.UTF_8));
+            output.flush();
+        }
+        return created;
     }
 
     public static Uri saveBitmap(ContentResolver resolver, Uri directoryUri,

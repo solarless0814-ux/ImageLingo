@@ -38,15 +38,22 @@ public final class TranslationClient {
 
     private static final String STRUCTURED_OUTPUT_INSTRUCTION =
             "번역 결과는 화면의 원문 위치 위에 표시해야 합니다. 반드시 마크다운 없이 유효한 JSON 객체 하나만 출력하세요. " +
-            "형식은 {\"blocks\":[{\"text\":\"한국어 번역\",\"x\":0,\"y\":0,\"width\":100,\"height\":100}]} 입니다. " +
+            "형식은 {\"blocks\":[{\"text\":\"한국어 번역\",\"x\":0,\"y\":0,\"width\":100,\"height\":100}]," +
+            "\"page_summary\":\"현재 페이지에서 일어난 일을 짧게 요약\"," +
+            "\"memory_updates\":{\"story_summary\":\"현재 페이지까지 반영한 짧은 누적 줄거리\"," +
+            "\"characters\":{\"원문 이름\":{\"korean_name\":\"통일 표기\",\"speech_style\":\"말투와 높임체\",\"role\":\"관계/역할\"}}," +
+            "\"terms\":{\"원문 고유명사\":\"통일 한국어 표기\"}," +
+            "\"honorifics\":{\"화자→상대\":\"사용할 호칭\"}}} 입니다. " +
             "x, y, width, height는 원본 이미지 전체를 가로·세로 각각 0~1000으로 본 정수 좌표입니다. " +
             "x,y는 원문 글자 영역의 왼쪽 위이고 width,height는 그 영역의 크기입니다. " +
             "말풍선이나 문단별로 blocks를 나누고 읽는 순서를 유지하세요. text에는 번역문만 넣고 원문·설명·번호를 넣지 마세요. " +
-            "원문 영역보다 너무 작게 잡지 말고 번역문이 들어갈 정도로 글자 영역 전체를 감싸세요. " +
-            "번역할 외국어가 없으면 {\"blocks\":[]}를 출력하세요.";
+            "이전 문맥에 이미 확정된 이름, 고유명사, 높임체, 호칭이 있으면 반드시 그대로 사용하세요. " +
+            "memory_updates에는 새로 발견했거나 명확해진 정보만 넣고, 불확실하면 빈 객체를 사용하세요. " +
+            "story_summary는 과도하게 길지 않게 현재 페이지까지의 핵심 사건과 관계만 누적 요약하세요. " +
+            "번역할 외국어가 없으면 blocks는 빈 배열로 반환하되 page_summary와 확실한 memory_updates는 유지할 수 있습니다.";
 
     private static final String USER_REQUEST =
-            "첨부한 이미지 안의 외국어 문구를 찾아 한국어로 번역하고, 각 원문 위치의 좌표와 함께 지정된 JSON 형식으로 반환해 주세요.";
+            "첨부한 이미지 안의 외국어 문구를 찾아 한국어로 번역하고, 기존 문맥과 용어집을 지켜 각 원문 위치의 좌표 및 문맥 업데이트와 함께 지정된 JSON 형식으로 반환해 주세요.";
 
     private static final Map<String, CachedToken> TOKEN_CACHE = new HashMap<>();
 
@@ -56,18 +63,28 @@ public final class TranslationClient {
 
     public static TranslationResult translate(ContentResolver resolver, Uri imageUri,
                                               ApiSettings settings, SecureStore secrets) throws Exception {
+        return translate(resolver, imageUri, settings, secrets, "");
+    }
+
+    public static TranslationResult translate(ContentResolver resolver, Uri imageUri,
+                                              ApiSettings settings, SecureStore secrets,
+                                              String continuityContext) throws Exception {
         ImagePayload image = encodeImage(resolver, imageUri);
         String systemPrompt = settings.systemPrompt().trim().isEmpty()
                 ? DEFAULT_SYSTEM_PROMPT : settings.systemPrompt().trim();
-        String structuredPrompt = systemPrompt + "\n\n" + STRUCTURED_OUTPUT_INSTRUCTION;
+        StringBuilder structuredPrompt = new StringBuilder(systemPrompt)
+                .append("\n\n").append(STRUCTURED_OUTPUT_INSTRUCTION);
+        if (continuityContext != null && !continuityContext.trim().isEmpty()) {
+            structuredPrompt.append("\n\n").append(continuityContext.trim());
+        }
         switch (settings.provider()) {
             case ApiSettings.OPENAI:
-                return translateOpenAi(image, structuredPrompt, settings, secrets.get("openai_key"));
+                return translateOpenAi(image, structuredPrompt.toString(), settings, secrets.get("openai_key"));
             case ApiSettings.VERTEX:
-                return translateVertex(image, structuredPrompt, settings, secrets.get("vertex_json"));
+                return translateVertex(image, structuredPrompt.toString(), settings, secrets.get("vertex_json"));
             case ApiSettings.GEMINI:
             default:
-                return translateGemini(image, structuredPrompt, settings, secrets.get("gemini_key"));
+                return translateGemini(image, structuredPrompt.toString(), settings, secrets.get("gemini_key"));
         }
     }
 
@@ -102,7 +119,7 @@ public final class TranslationClient {
         String rawText = parseOpenAiText(response);
         TokenUsage usage = parseOpenAiUsage(response);
         ParsedTranslation parsed = parseStructuredTranslation(rawText);
-        return new TranslationResult(parsed.text, usage, parsed.blocks);
+        return new TranslationResult(parsed.text, usage, parsed.blocks, parsed.pageSummary, parsed.memoryUpdates);
     }
 
     private static String parseOpenAiText(JSONObject response) {
@@ -248,13 +265,16 @@ public final class TranslationClient {
             tokenUsage = new TokenUsage(input, output, total, reasoning);
         }
         ParsedTranslation parsed = parseStructuredTranslation(result.toString().trim());
-        return new TranslationResult(parsed.text, tokenUsage, parsed.blocks);
+        return new TranslationResult(parsed.text, tokenUsage, parsed.blocks, parsed.pageSummary, parsed.memoryUpdates);
     }
 
     private static ParsedTranslation parseStructuredTranslation(String rawText) {
         String clean = stripCodeFence(rawText == null ? "" : rawText.trim());
         List<TranslationBlock> blocks = new ArrayList<>();
         List<String> unplacedTexts = new ArrayList<>();
+        String pageSummary = "";
+        JSONObject memoryUpdates = new JSONObject();
+        JSONObject rootObject = null;
         try {
             JSONArray values;
             if (clean.startsWith("[")) {
@@ -263,9 +283,13 @@ public final class TranslationClient {
                 int start = clean.indexOf('{');
                 int end = clean.lastIndexOf('}');
                 if (start < 0 || end <= start) throw new IllegalArgumentException("JSON 객체 없음");
-                JSONObject root = new JSONObject(clean.substring(start, end + 1));
-                values = root.optJSONArray("blocks");
-                if (values == null) values = root.optJSONArray("translations");
+                rootObject = new JSONObject(clean.substring(start, end + 1));
+                pageSummary = firstNonEmpty(rootObject.optString("page_summary", ""),
+                        rootObject.optString("summary", "")).trim();
+                JSONObject updates = rootObject.optJSONObject("memory_updates");
+                if (updates != null) memoryUpdates = updates;
+                values = rootObject.optJSONArray("blocks");
+                if (values == null) values = rootObject.optJSONArray("translations");
                 if (values == null) values = new JSONArray();
             }
             for (int i = 0; i < values.length(); i++) {
@@ -327,10 +351,8 @@ public final class TranslationClient {
                 blocks.add(new TranslationBlock(text, safeX, safeY, safeWidth, safeHeight));
             }
         } catch (Exception ignored) {
-            // Some compatible endpoints ignore JSON-only instructions. The fallback below
-            // still renders the translation in a translucent image overlay instead of a bottom bar.
+            // Compatible endpoints may ignore JSON-only instructions. Fallback below keeps the translation usable.
         }
-
 
         if (!unplacedTexts.isEmpty()) {
             int count = unplacedTexts.size();
@@ -347,10 +369,8 @@ public final class TranslationClient {
                 && !clean.equals("{\"blocks\":[]}") && !clean.equals("[]")) {
             String fallbackText = clean;
             try {
-                JSONObject root = new JSONObject(clean);
-                if (root.optJSONArray("blocks") != null && root.optJSONArray("blocks").length() == 0) {
-                    fallbackText = "";
-                }
+                JSONObject root = rootObject != null ? rootObject : new JSONObject(clean);
+                if (root.optJSONArray("blocks") != null) fallbackText = "";
             } catch (Exception ignored) {}
             if (!fallbackText.isEmpty()) {
                 blocks.add(new TranslationBlock(fallbackText, 80f, 690f, 840f, 240f));
@@ -363,7 +383,7 @@ public final class TranslationClient {
             combined.append(block.text);
         }
         String text = combined.length() == 0 ? "[번역할 텍스트 없음]" : combined.toString();
-        return new ParsedTranslation(text, blocks);
+        return new ParsedTranslation(text, blocks, pageSummary, memoryUpdates);
     }
 
     private static String stripCodeFence(String value) {
@@ -395,9 +415,14 @@ public final class TranslationClient {
     private static final class ParsedTranslation {
         final String text;
         final List<TranslationBlock> blocks;
-        ParsedTranslation(String text, List<TranslationBlock> blocks) {
+        final String pageSummary;
+        final JSONObject memoryUpdates;
+        ParsedTranslation(String text, List<TranslationBlock> blocks,
+                          String pageSummary, JSONObject memoryUpdates) {
             this.text = text;
             this.blocks = blocks;
+            this.pageSummary = pageSummary == null ? "" : pageSummary;
+            this.memoryUpdates = memoryUpdates == null ? new JSONObject() : memoryUpdates;
         }
     }
 
@@ -490,7 +515,7 @@ public final class TranslationClient {
         connection.setDoOutput(true);
         connection.setRequestProperty("Content-Type", contentType);
         connection.setRequestProperty("Accept", "application/json");
-        connection.setRequestProperty("User-Agent", "ImageLingo/0.7 Android");
+        connection.setRequestProperty("User-Agent", "ImageLingo/0.8 Android");
         for (Map.Entry<String, String> entry : headers.entrySet()) {
             connection.setRequestProperty(entry.getKey(), entry.getValue());
         }
@@ -551,11 +576,21 @@ public final class TranslationClient {
         public final String text;
         public final TokenUsage usage;
         public final List<TranslationBlock> blocks;
+        public final String pageSummary;
+        public final JSONObject memoryUpdates;
 
-        TranslationResult(String text, TokenUsage usage, List<TranslationBlock> blocks) {
+        TranslationResult(String text, TokenUsage usage, List<TranslationBlock> blocks,
+                          String pageSummary, JSONObject memoryUpdates) {
             this.text = text == null ? "" : text;
             this.usage = usage == null ? TokenUsage.unavailable() : usage;
             this.blocks = blocks == null ? new ArrayList<>() : new ArrayList<>(blocks);
+            this.pageSummary = pageSummary == null ? "" : pageSummary;
+            try {
+                this.memoryUpdates = memoryUpdates == null
+                        ? new JSONObject() : new JSONObject(memoryUpdates.toString());
+            } catch (Exception ignored) {
+                throw new IllegalArgumentException("문맥 업데이트 JSON을 복사하지 못했습니다.");
+            }
         }
     }
 

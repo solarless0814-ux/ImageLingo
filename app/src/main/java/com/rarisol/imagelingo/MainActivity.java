@@ -92,6 +92,8 @@ public final class MainActivity extends Activity {
     private volatile boolean batchStopRequested;
     private volatile String processingImageUri;
     private volatile int processingPageNumber;
+    private volatile TranslationMemory translationMemory;
+    private volatile Uri outputDirectoryUri;
     private boolean translatedOnlyMode;
     private String currentTranslationText = "";
 
@@ -414,6 +416,7 @@ public final class MainActivity extends Activity {
                 List<ImageRepository.ImageEntry> loaded = ImageRepository.listImages(getContentResolver(), treeUri);
                 Map<String, Uri> restoredOutputs = new HashMap<>();
                 Uri outputDir = ImageRepository.findSubdirectory(getContentResolver(), treeUri, OUTPUT_DIR_NAME);
+                TranslationMemory restoredMemory = TranslationMemory.load(getContentResolver(), outputDir);
                 if (outputDir != null) {
                     Map<String, Uri> outputsByName = ImageRepository.listImageDocumentsByName(
                             getContentResolver(), outputDir);
@@ -425,6 +428,8 @@ public final class MainActivity extends Activity {
                 runOnUiThread(() -> {
                     progressBar.setVisibility(View.GONE);
                     allImages = loaded;
+                    outputDirectoryUri = outputDir;
+                    translationMemory = restoredMemory;
                     translatedOutputMap.clear();
                     translatedOutputMap.putAll(restoredOutputs);
                     if (loaded.isEmpty()) {
@@ -587,6 +592,11 @@ public final class MainActivity extends Activity {
             text.append(" · 현재 ").append(processingPage).append(" / ").append(total).append("페이지");
         }
         if (translatedOnlyMode) text.append(" · 번역본 모드");
+        TranslationMemory memory = translationMemory;
+        if (memory != null) {
+            int memoryItems = memory.characterCount() + memory.termCount() + memory.honorificCount();
+            if (memoryItems > 0) text.append(" · 문맥 ").append(memoryItems);
+        }
         progressTextView.setText(text.toString());
     }
 
@@ -716,8 +726,12 @@ public final class MainActivity extends Activity {
         boolean hasUsage = false;
         boolean stopped = false;
         List<String> failures = new ArrayList<>();
+        List<String> warnings = new ArrayList<>();
         try {
             Uri outputDir = ImageRepository.ensureSubdirectory(getContentResolver(), treeUri, OUTPUT_DIR_NAME);
+            outputDirectoryUri = outputDir;
+            TranslationMemory memory = TranslationMemory.load(getContentResolver(), outputDir);
+            translationMemory = memory;
             for (int i = 0; i < snapshot.size(); i++) {
                 if (batchStopRequested) {
                     stopped = true;
@@ -760,14 +774,10 @@ public final class MainActivity extends Activity {
                     }
 
                     String key = cacheKeyFor(entry);
-                    TranslationClient.TranslationResult result = translationCache.get(key);
-                    boolean cached = result != null;
-                    if (!cached) {
-                        result = TranslationClient.translate(getContentResolver(), entry.uri, apiSettings, secureStore);
-                        translationCache.put(key, result);
-                    } else {
-                        cacheCount++;
-                    }
+                    String continuityContext = memory.buildContextPrompt();
+                    TranslationClient.TranslationResult result = TranslationClient.translate(
+                            getContentResolver(), entry.uri, apiSettings, secureStore, continuityContext);
+                    translationCache.put(key, result);
 
                     Bitmap source = decodeForDisplay(entry.uri);
                     Bitmap composed = TranslatedImageRenderer.compose(source, result.blocks);
@@ -776,8 +786,15 @@ public final class MainActivity extends Activity {
                     translatedOutputMap.put(entry.uri.toString(), savedUri);
                     composed.recycle();
                     successCount++;
+                    memory.applyResult(entry.name, result);
+                    try {
+                        memory.save(getContentResolver(), outputDir);
+                    } catch (Exception memorySaveError) {
+                        warnings.add(entry.name + "\n• 번역 이미지는 저장됐지만 문맥 파일 저장 실패: "
+                                + cleanMessage(memorySaveError));
+                    }
 
-                    if (!cached && result.usage != null && result.usage.isAvailable()) {
+                    if (result.usage != null && result.usage.isAvailable()) {
                         if (result.usage.inputTokens >= 0) inputTokens += result.usage.inputTokens;
                         if (result.usage.outputTokens >= 0) outputTokens += result.usage.outputTokens;
                         if (result.usage.totalTokens >= 0) totalTokens += result.usage.totalTokens;
@@ -843,7 +860,11 @@ public final class MainActivity extends Activity {
                         .append("이미 번역되어 건너뜀: ").append(finalSkippedCount).append("장\n")
                         .append("캐시 사용: ").append(finalCacheCount).append("장\n")
                         .append("실패: ").append(finalFailureCount).append("장\n\n")
+                        .append("문맥 메모리: 인물 ").append(memory.characterCount())
+                        .append(" · 용어 ").append(memory.termCount())
+                        .append(" · 호칭 ").append(memory.honorificCount()).append("\n")
                         .append("저장 위치: 선택한 폴더 안 ‘").append(OUTPUT_DIR_NAME).append("’ 폴더\n")
+                        .append("문맥 파일: ").append(TranslationMemory.FILE_NAME).append("\n")
                         .append("출력 형식: 원문 위에 반투명 박스와 번역문이 합성된 PNG 파일");
                 if (!failures.isEmpty()) {
                     summary.append("\n\n실패한 파일\n");
@@ -854,6 +875,14 @@ public final class MainActivity extends Activity {
                     }
                     if (failures.size() > limit) {
                         summary.append("\n\n그 외 ").append(failures.size() - limit).append("건 더 있음");
+                    }
+                }
+                if (!warnings.isEmpty()) {
+                    summary.append("\n\n문맥 저장 경고\n");
+                    int limit = Math.min(3, warnings.size());
+                    for (int i = 0; i < limit; i++) {
+                        if (i > 0) summary.append("\n\n");
+                        summary.append(warnings.get(i));
                     }
                 }
                 showResult(finalStopped ? "폴더 번역 중지됨" : "폴더 번역 완료",
@@ -912,6 +941,11 @@ public final class MainActivity extends Activity {
                 text.append("  ·  입력 ").append(format.format(inputTokens));
                 text.append(" / 출력 ").append(format.format(outputTokens));
             }
+        }
+        TranslationMemory memory = translationMemory;
+        if (memory != null) {
+            int memoryItems = memory.characterCount() + memory.termCount() + memory.honorificCount();
+            if (memoryItems > 0) text.append("\n문맥 항목 ").append(memoryItems);
         }
         tokenBadge.setText(text.toString());
         tokenBadge.setVisibility(View.VISIBLE);
@@ -1006,6 +1040,21 @@ public final class MainActivity extends Activity {
         fillDefault.setOnClickListener(v -> systemPrompt.setText(TranslationClient.defaultSystemPrompt()));
         form.addView(fillDefault, fieldParams());
 
+        form.addView(section("문맥 메모리"));
+        TranslationMemory currentMemory = translationMemory;
+        String memoryDescription = currentMemory == null
+                ? "폴더를 선택하면 이름·고유명사·높임체·호칭을 폴더별로 자동 저장합니다."
+                : "인물 " + currentMemory.characterCount() + " · 용어 " + currentMemory.termCount()
+                + " · 호칭 " + currentMemory.honorificCount() + "\n" + currentMemory.summaryPreview();
+        TextView memoryStatus = caption(memoryDescription);
+        form.addView(memoryStatus, matchWrap());
+        Button viewMemory = makeDialogButton("현재 문맥 요약 보기");
+        viewMemory.setOnClickListener(v -> showTranslationMemoryDialog());
+        form.addView(viewMemory, fieldParams());
+        Button resetMemory = makeDialogButton("현재 폴더 문맥 초기화");
+        resetMemory.setOnClickListener(v -> confirmResetTranslationMemory(memoryStatus));
+        form.addView(resetMemory, fieldParams());
+
         AlertDialog dialog = new AlertDialog.Builder(this)
                 .setTitle("AI 번역 설정")
                 .setView(scroll)
@@ -1039,6 +1088,96 @@ public final class MainActivity extends Activity {
         }));
         dialog.setOnDismissListener(ignored -> vertexStatusText = null);
         dialog.show();
+    }
+
+    private void showTranslationMemoryDialog() {
+        TranslationMemory memory = translationMemory;
+        if (memory == null) {
+            Toast.makeText(this, "먼저 이미지 폴더를 선택하세요.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        JSONObject value = memory.copyRoot();
+        String formatted;
+        try { formatted = value.toString(2); }
+        catch (Exception ignored) { formatted = value.toString(); }
+
+        EditText editor = new EditText(this);
+        editor.setText(formatted);
+        editor.setTextColor(0xFF252833);
+        editor.setTextSize(12f);
+        editor.setGravity(Gravity.TOP | Gravity.START);
+        editor.setInputType(InputType.TYPE_CLASS_TEXT
+                | InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        editor.setPadding(dp(14), dp(12), dp(14), dp(20));
+        editor.setMinLines(16);
+
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(editor, new ScrollView.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("현재 폴더 문맥 편집")
+                .setMessage("characters, terms, honorifics 값을 수정하면 다음 페이지부터 통일 규칙에 반영됩니다.")
+                .setView(scroll)
+                .setNegativeButton("취소", null)
+                .setPositiveButton("저장", null)
+                .create();
+        dialog.setOnShowListener(ignored -> dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+                .setOnClickListener(v -> {
+                    try {
+                        memory.replaceFromJson(editor.getText().toString());
+                        Uri outputDir = outputDirectoryUri;
+                        if (outputDir == null) {
+                            outputDir = ImageRepository.ensureSubdirectory(
+                                    getContentResolver(), currentTreeUri, OUTPUT_DIR_NAME);
+                            outputDirectoryUri = outputDir;
+                        }
+                        memory.save(getContentResolver(), outputDir);
+                        translationCache.clear();
+                        updateTopProgress(processingPageNumber);
+                        Toast.makeText(this, "문맥 메모리를 저장했습니다.", Toast.LENGTH_SHORT).show();
+                        dialog.dismiss();
+                    } catch (Exception e) {
+                        Toast.makeText(this, "JSON 저장 오류: " + cleanMessage(e), Toast.LENGTH_LONG).show();
+                    }
+                }));
+        dialog.show();
+    }
+
+    private void confirmResetTranslationMemory(TextView statusView) {
+        if (batchRunning) {
+            Toast.makeText(this, "번역이 끝난 뒤 문맥을 초기화하세요.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        Uri outputDir = outputDirectoryUri;
+        if (currentTreeUri == null) {
+            Toast.makeText(this, "먼저 이미지 폴더를 선택하세요.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("문맥 메모리 초기화")
+                .setMessage("저장된 이름, 고유명사, 높임체, 호칭과 줄거리 요약을 모두 지울까요? 번역 이미지 파일은 삭제되지 않습니다.")
+                .setNegativeButton("취소", null)
+                .setPositiveButton("초기화", (dialog, which) -> executor.execute(() -> {
+                    try {
+                        Uri target = outputDir != null ? outputDir
+                                : ImageRepository.ensureSubdirectory(getContentResolver(), currentTreeUri, OUTPUT_DIR_NAME);
+                        TranslationMemory.reset(getContentResolver(), target);
+                        TranslationMemory reset = TranslationMemory.load(getContentResolver(), target);
+                        translationMemory = reset;
+                        outputDirectoryUri = target;
+                        translationCache.clear();
+                        runOnUiThread(() -> {
+                            statusView.setText("인물 0 · 용어 0 · 호칭 0\n아직 누적 줄거리 없음");
+                            updateTopProgress(processingPageNumber);
+                            Toast.makeText(this, "문맥 메모리를 초기화했습니다.", Toast.LENGTH_SHORT).show();
+                        });
+                    } catch (Exception e) {
+                        runOnUiThread(() -> Toast.makeText(this,
+                                "초기화 오류: " + cleanMessage(e), Toast.LENGTH_LONG).show());
+                    }
+                }))
+                .show();
     }
 
     private String activeModel() {
