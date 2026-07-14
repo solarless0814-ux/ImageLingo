@@ -62,7 +62,7 @@ public final class MainActivity extends Activity {
 
     private final ExecutorService executor = Executors.newFixedThreadPool(2);
     private final AtomicInteger imageLoadVersion = new AtomicInteger();
-    private final Map<String, TranslationClient.TranslationResult> translationCache = new HashMap<>();
+    private final Map<String, TranslationClient.TranslationResult> translationCache = new ConcurrentHashMap<>();
     private final Map<String, Uri> translatedOutputMap = new ConcurrentHashMap<>();
 
     private ZoomImageView imageView;
@@ -90,6 +90,8 @@ public final class MainActivity extends Activity {
     private Uri currentTreeUri;
     private volatile boolean batchRunning;
     private volatile boolean batchStopRequested;
+    private volatile String processingImageUri;
+    private volatile int processingPageNumber;
     private boolean translatedOnlyMode;
     private String currentTranslationText = "";
 
@@ -453,12 +455,7 @@ public final class MainActivity extends Activity {
     }
 
     private void toggleTranslatedOnlyMode() {
-        if (batchRunning) {
-            Toast.makeText(this, "폴더 번역이 끝난 뒤 보기 모드를 바꿔 주세요.", Toast.LENGTH_SHORT).show();
-            return;
-        }
-        String preferredUri = currentIndex >= 0 && currentIndex < images.size()
-                ? images.get(currentIndex).uri.toString() : null;
+        String preferredUri = currentVisibleUri();
         translatedOnlyMode = !translatedOnlyMode;
         appPrefs.edit().putBoolean("translated_only_mode", translatedOnlyMode).apply();
         applyViewMode(preferredUri);
@@ -468,14 +465,17 @@ public final class MainActivity extends Activity {
         List<ImageRepository.ImageEntry> next = new ArrayList<>();
         if (translatedOnlyMode) {
             for (ImageRepository.ImageEntry entry : allImages) {
-                if (translatedOutputMap.containsKey(entry.uri.toString())) next.add(entry);
+                String uri = entry.uri.toString();
+                boolean translated = translatedOutputMap.containsKey(uri);
+                boolean currentlyProcessing = batchRunning && uri.equals(processingImageUri);
+                if (translated || currentlyProcessing) next.add(entry);
             }
         } else {
             next.addAll(allImages);
         }
         images = next;
         if (modeButton != null) modeButton.setText(translatedOnlyMode ? "전체 보기" : "번역본만");
-        updateTopProgress(0);
+        updateTopProgress(processingPageNumber);
 
         if (images.isEmpty()) {
             imageLoadVersion.incrementAndGet();
@@ -495,17 +495,77 @@ public final class MainActivity extends Activity {
             return;
         }
 
-        int nextIndex = 0;
-        if (preferredUri != null) {
-            for (int i = 0; i < images.size(); i++) {
-                if (preferredUri.equals(images.get(i).uri.toString())) {
-                    nextIndex = i;
-                    break;
-                }
+        int nextIndex = findImageIndex(preferredUri);
+        if (nextIndex < 0 && translatedOnlyMode && processingImageUri != null) {
+            nextIndex = findImageIndex(processingImageUri);
+        }
+        currentIndex = Math.max(0, nextIndex);
+        renderCurrent();
+    }
+
+    private int findImageIndex(String uri) {
+        if (uri == null) return -1;
+        for (int i = 0; i < images.size(); i++) {
+            if (uri.equals(images.get(i).uri.toString())) return i;
+        }
+        return -1;
+    }
+
+    private String currentVisibleUri() {
+        return currentIndex >= 0 && currentIndex < images.size()
+                ? images.get(currentIndex).uri.toString() : null;
+    }
+
+    private void refreshLiveView(String preferredUri, String changedUri) {
+        if (translatedOnlyMode) {
+            updateTranslatedOnlyListLive(preferredUri, false, changedUri);
+        } else {
+            updateTopProgress(processingPageNumber);
+            if (changedUri != null && changedUri.equals(currentVisibleUri())) {
+                renderCurrent();
             }
         }
-        currentIndex = nextIndex;
-        renderCurrent();
+    }
+
+    private void updateTranslatedOnlyListLive(String preferredUri, boolean followNewest,
+                                              String changedUri) {
+        String oldVisibleUri = currentVisibleUri();
+        List<ImageRepository.ImageEntry> next = new ArrayList<>();
+        for (ImageRepository.ImageEntry entry : allImages) {
+            String uri = entry.uri.toString();
+            if (translatedOutputMap.containsKey(uri)
+                    || (batchRunning && uri.equals(processingImageUri))) {
+                next.add(entry);
+            }
+        }
+        images = next;
+        modeButton.setText("전체 보기");
+        updateTopProgress(processingPageNumber);
+        if (images.isEmpty()) {
+            applyViewMode(preferredUri);
+            return;
+        }
+
+        String targetUri = followNewest && processingImageUri != null
+                ? processingImageUri : preferredUri;
+        int nextIndex = findImageIndex(targetUri);
+        if (nextIndex < 0 && processingImageUri != null) nextIndex = findImageIndex(processingImageUri);
+        currentIndex = Math.max(0, nextIndex);
+        ImageRepository.ImageEntry selected = images.get(currentIndex);
+        String selectedUri = selected.uri.toString();
+        boolean selectedChanged = oldVisibleUri == null || !oldVisibleUri.equals(selectedUri);
+        boolean contentChanged = changedUri != null && changedUri.equals(selectedUri);
+        if (selectedChanged || contentChanged || currentBitmap == null) {
+            renderCurrent();
+            return;
+        }
+
+        titleView.setText(selected.name);
+        boolean saved = translatedOutputMap.containsKey(selectedUri);
+        boolean processing = batchRunning && selectedUri.equals(processingImageUri) && !saved;
+        subtitleView.setText("번역본 " + (currentIndex + 1) + " / " + images.size()
+                + "  ·  " + providerLabel()
+                + (saved ? "  ·  저장됨" : processing ? "  ·  번역 중" : ""));
     }
 
     private int countTranslatedPages() {
@@ -524,7 +584,7 @@ public final class MainActivity extends Activity {
         text.append("번역 완료 ").append(translated).append(" / ").append(total)
                 .append(" · ").append(percent).append("%");
         if (batchRunning && processingPage > 0) {
-            text.append(" · 처리 ").append(processingPage).append("페이지");
+            text.append(" · 현재 ").append(processingPage).append(" / ").append(total).append("페이지");
         }
         if (translatedOnlyMode) text.append(" · 번역본 모드");
         progressTextView.setText(text.toString());
@@ -535,9 +595,12 @@ public final class MainActivity extends Activity {
         int version = imageLoadVersion.incrementAndGet();
         ImageRepository.ImageEntry entry = images.get(currentIndex);
         titleView.setText(entry.name);
+        boolean processing = batchRunning && entry.uri.toString().equals(processingImageUri)
+                && !translatedOutputMap.containsKey(entry.uri.toString());
         subtitleView.setText((translatedOnlyMode ? "번역본 " : "")
-                + (currentIndex + 1) + " / " + images.size() + "  ·  " + providerLabel());
-        updateTopProgress(0);
+                + (currentIndex + 1) + " / " + images.size() + "  ·  " + providerLabel()
+                + (processing ? "  ·  번역 중" : ""));
+        updateTopProgress(processingPageNumber);
         progressBar.setVisibility(View.VISIBLE);
         translationPanel.setVisibility(View.GONE);
         executor.execute(() -> {
@@ -556,10 +619,13 @@ public final class MainActivity extends Activity {
                     currentTranslationText = cached == null ? "" : cached.text;
                     copyButton.setVisibility(batchRunning || currentTranslationText.isEmpty() ? View.GONE : View.VISIBLE);
                     stopButton.setVisibility(batchRunning ? View.VISIBLE : View.GONE);
+                    boolean processingNow = batchRunning
+                            && entry.uri.toString().equals(processingImageUri)
+                            && displayUri == null;
                     subtitleView.setText((translatedOnlyMode ? "번역본 " : "")
                             + (currentIndex + 1) + " / " + images.size() + "  ·  " + providerLabel()
-                            + (displayUri != null ? "  ·  저장됨" : ""));
-                    updateTopProgress(0);
+                            + (displayUri != null ? "  ·  저장됨" : processingNow ? "  ·  번역 중" : ""));
+                    updateTopProgress(processingPageNumber);
                 });
             } catch (Exception e) {
                 runOnUiThread(() -> {
@@ -585,10 +651,6 @@ public final class MainActivity extends Activity {
     }
 
     private void movePage(int direction) {
-        if (batchRunning) {
-            Toast.makeText(this, "폴더 전체 번역 중에는 페이지 이동을 잠시 막아 둡니다.", Toast.LENGTH_SHORT).show();
-            return;
-        }
         if (images.isEmpty()) return;
         int next = currentIndex + direction;
         if (next < 0 || next >= images.size()) {
@@ -608,6 +670,8 @@ public final class MainActivity extends Activity {
         }
         batchRunning = true;
         batchStopRequested = false;
+        processingImageUri = null;
+        processingPageNumber = 0;
         imageLoadVersion.incrementAndGet();
         translationPanel.setVisibility(View.GONE);
         currentTranslationText = "";
@@ -615,13 +679,13 @@ public final class MainActivity extends Activity {
         stopButton.setText("번역 중지");
         stopButton.setEnabled(true);
         stopButton.setVisibility(View.VISIBLE);
-        progressBar.setVisibility(View.VISIBLE);
+        progressBar.setVisibility(View.GONE);
         tokenBadge.setVisibility(View.GONE);
         translateButton.setEnabled(false);
         translateButton.setText("폴더 번역 중…");
         translateButton.setAlpha(0.75f);
-        modeButton.setEnabled(false);
-        modeButton.setAlpha(0.65f);
+        modeButton.setEnabled(true);
+        modeButton.setAlpha(1f);
         imageView.resetMatrix();
 
         List<ImageRepository.ImageEntry> snapshot = new ArrayList<>(allImages);
@@ -629,7 +693,7 @@ public final class MainActivity extends Activity {
         String pinnedUri = currentIndex >= 0 && currentIndex < images.size()
                 ? images.get(currentIndex).uri.toString()
                 : allImages.get(0).uri.toString();
-        updateTopProgress(1);
+        updateTopProgress(0);
         executor.execute(() -> runFolderTranslation(snapshot, treeUri, pinnedUri));
     }
 
@@ -661,10 +725,17 @@ public final class MainActivity extends Activity {
                 }
                 final int displayIndex = i;
                 ImageRepository.ImageEntry entry = snapshot.get(i);
+                processingImageUri = entry.uri.toString();
+                processingPageNumber = displayIndex + 1;
                 runOnUiThread(() -> {
-                    titleView.setText(entry.name);
-                    subtitleView.setText("번역 중 " + (displayIndex + 1) + " / " + snapshot.size() + "  ·  " + providerLabel());
-                    updateTopProgress(displayIndex + 1);
+                    String preferred = currentVisibleUri();
+                    if (translatedOnlyMode) {
+                        boolean followNewest = images.isEmpty() || currentIndex == images.size() - 1;
+                        updateTranslatedOnlyListLive(preferred, followNewest, null);
+                    } else {
+                        updateTopProgress(processingPageNumber);
+                        if (entry.uri.toString().equals(preferred)) renderCurrent();
+                    }
                 });
                 try {
                     String outputName = outputNameFor(entry.name);
@@ -683,7 +754,7 @@ public final class MainActivity extends Activity {
                         runOnUiThread(() -> {
                             showBatchTokenProgress(displayIndex + 1, snapshot.size(),
                                     fSuccess, fFailure, fCache, fSkipped, fUsage, fInput, fOutput, fTotal);
-                            updateTopProgress(displayIndex + 1);
+                            refreshLiveView(currentVisibleUri(), entry.uri.toString());
                         });
                         continue;
                     }
@@ -724,7 +795,7 @@ public final class MainActivity extends Activity {
                     runOnUiThread(() -> {
                         showBatchTokenProgress(displayIndex + 1, snapshot.size(),
                                 fSuccess, fFailure, fCache, fSkipped, fUsage, fInput, fOutput, fTotal);
-                        updateTopProgress(displayIndex + 1);
+                        refreshLiveView(currentVisibleUri(), entry.uri.toString());
                     });
                 } catch (Exception imageError) {
                     failureCount++;
@@ -740,7 +811,7 @@ public final class MainActivity extends Activity {
                     runOnUiThread(() -> {
                         showBatchTokenProgress(displayIndex + 1, snapshot.size(),
                                 fSuccess, fFailure, fCache, fSkipped, fUsage, fInput, fOutput, fTotal);
-                        updateTopProgress(displayIndex + 1);
+                        refreshLiveView(currentVisibleUri(), entry.uri.toString());
                     });
                 }
             }
@@ -755,8 +826,11 @@ public final class MainActivity extends Activity {
             final boolean finalHasUsage = hasUsage;
             final boolean finalStopped = stopped;
             runOnUiThread(() -> {
+                String visibleBeforeFinish = currentVisibleUri();
+                processingImageUri = null;
+                processingPageNumber = 0;
                 finishBatchUi();
-                applyViewMode(pinnedUri);
+                applyViewMode(visibleBeforeFinish != null ? visibleBeforeFinish : pinnedUri);
                 int processedCount = finalSuccessCount + finalFailureCount + finalSkippedCount;
                 StringBuilder summary = new StringBuilder();
                 summary.append("선택한 폴더 전체 ").append(snapshot.size()).append("장 중 ")
@@ -793,6 +867,8 @@ public final class MainActivity extends Activity {
             });
         } catch (Exception e) {
             runOnUiThread(() -> {
+                processingImageUri = null;
+                processingPageNumber = 0;
                 finishBatchUi();
                 updateTopProgress(0);
                 showResult(providerLabel() + " 오류", cleanMessage(e), true);
@@ -804,6 +880,8 @@ public final class MainActivity extends Activity {
     private void finishBatchUi() {
         batchRunning = false;
         batchStopRequested = false;
+        processingImageUri = null;
+        processingPageNumber = 0;
         progressBar.setVisibility(View.GONE);
         translateButton.setEnabled(true);
         translateButton.setText("폴더 번역");
