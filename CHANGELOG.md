@@ -29,6 +29,8 @@
 
 ### 개선
 
+- Vertex AI에서 `gemini-3.7-flash` 요청이 HTTP 400 `Request contains an invalid argument`로 실패하던 구조화 출력 형식 회귀 수정
+- Vertex `global`/`us`/`eu` 엔드포인트 선택, 모델명 정규화, 지원 리전 사전 검증과 Google `fieldViolations` 오류 표시 추가
 - 번역 요청 준비와 페이지 처리 흐름을 최적화해 체감 대기 시간 단축
 - 표시용 디코드와 저장 합성용 디코드를 분리하고, 저장 경로에 최대 변 4096px/1,000만 픽셀 안전 상한 및 예외 시 bitmap 회수를 적용
 - 출력 폴더를 페이지마다 다시 조회하지 않고 한 번의 스냅샷을 재사용하도록 SAF 저장 속도 개선

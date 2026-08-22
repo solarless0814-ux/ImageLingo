@@ -32,12 +32,15 @@ ImageLingo는 선택한 폴더의 이미지를 순서대로 읽어 Gemini API, O
    - 기본 제공자: Gemini API
    - OpenAI 기본 모델: `gpt-5.6-luna`
    - Gemini API/Vertex AI 기본 모델: `gemini-3.7-flash`
+   - Vertex AI `gemini-3.7-flash` 리전: `global` 권장 (`us`, `eu`도 지원)
    - OpenAI 기본 엔드포인트: `https://api.openai.com/v1/responses`
 3. **폴더**에서 원본 이미지 폴더를 선택합니다.
 4. **폴더 번역**을 누릅니다. 현재 결과가 있는 페이지는 건너뜁니다.
 5. 기존 결과까지 다시 API로 보내려면 **폴더 번역을 길게 누릅니다**. 강제 재번역은 API 사용량과 비용이 다시 발생하며 기존 번역 PNG를 갱신합니다.
 
 모델명과 OpenAI 엔드포인트는 설정에서 바꿀 수 있습니다. 선택한 계정에서 실제로 사용할 수 있는 모델명을 입력해야 합니다. `Flex` 지원 여부와 대기 시간은 OpenAI 계정/모델 정책에 따라 다르며, 지원하지 않는 조합에서는 `Standard`를 사용합니다.
+
+Vertex AI의 Gemini 3 모델은 Vertex REST v1 전용 구조화 출력 형식으로 요청합니다. `gemini-3.7-flash`에는 `global`, `us`, `eu`만 입력할 수 있으며, `us`/`eu`는 각각 Google의 멀티 리전 호스트로 연결됩니다. 잘못된 요청에서 Google이 `fieldViolations`를 반환하면 앱 오류 창에 문제 필드와 설명을 함께 표시합니다.
 
 ## 출력 위치와 로컬 파일
 

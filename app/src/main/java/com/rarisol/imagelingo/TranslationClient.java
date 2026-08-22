@@ -83,7 +83,8 @@ public final class TranslationClient {
                 NetworkPolicy.requireHttps(settings.openAiEndpoint());
                 break;
             case ApiSettings.VERTEX:
-                require(settings.vertexModel(), "Vertex AI 모델명이 비어 있습니다.");
+                String vertexModel = normalizeModelId(settings.vertexModel());
+                require(vertexModel, "Vertex AI 모델명이 비어 있습니다.");
                 String jsonText = secrets.get("vertex_json");
                 require(jsonText, "Vertex AI 서비스 계정 JSON을 불러오지 않았습니다.");
                 JSONObject service = new JSONObject(jsonText);
@@ -95,11 +96,11 @@ public final class TranslationClient {
                 String project = settings.vertexProject().trim();
                 if (project.isEmpty()) project = service.optString("project_id", "");
                 require(project, "Vertex AI 프로젝트 ID가 없습니다.");
-                String location = settings.vertexLocation().trim().isEmpty()
-                        ? "global" : settings.vertexLocation().trim();
+                String location = normalizeVertexLocation(settings.vertexLocation());
                 if (!location.matches("[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")) {
                     throw new IllegalArgumentException("Vertex AI 리전 형식이 올바르지 않습니다.");
                 }
+                validateVertexModelLocation(vertexModel, location);
                 break;
             case ApiSettings.GEMINI:
             default:
@@ -212,13 +213,12 @@ public final class TranslationClient {
                 .put("maximum", 1000);
         JSONObject dimension = new JSONObject()
                 .put("type", "number")
-                .put("exclusiveMinimum", 0)
+                .put("minimum", 1)
                 .put("maximum", 1000);
         JSONObject block = new JSONObject()
                 .put("type", "object")
                 .put("properties", new JSONObject()
-                        .put("text", new JSONObject().put("type", "string")
-                                .put("maxLength", MAX_BLOCK_TEXT_CHARACTERS))
+                        .put("text", new JSONObject().put("type", "string"))
                         .put("x", coordinate)
                         .put("y", coordinate)
                         .put("width", dimension)
@@ -226,26 +226,100 @@ public final class TranslationClient {
                 .put("required", new JSONArray()
                         .put("text").put("x").put("y").put("width").put("height"))
                 .put("additionalProperties", false);
-        JSONObject memoryMap = new JSONObject()
+        JSONObject stringValue = new JSONObject().put("type", "string");
+        JSONObject characterValue = new JSONObject()
                 .put("type", "object")
-                .put("additionalProperties", true);
+                .put("properties", new JSONObject()
+                        .put("korean_name", new JSONObject(stringValue.toString()))
+                        .put("speech_style", new JSONObject(stringValue.toString()))
+                        .put("role", new JSONObject(stringValue.toString())))
+                .put("additionalProperties", false);
+        JSONObject characterMap = new JSONObject()
+                .put("type", "object")
+                .put("additionalProperties", characterValue);
+        JSONObject stringMap = new JSONObject()
+                .put("type", "object")
+                .put("additionalProperties", stringValue);
         JSONObject memory = new JSONObject()
                 .put("type", "object")
                 .put("properties", new JSONObject()
-                        .put("characters", memoryMap)
-                        .put("terms", new JSONObject(memoryMap.toString()))
-                        .put("honorifics", new JSONObject(memoryMap.toString())))
+                        .put("characters", characterMap)
+                        .put("terms", stringMap)
+                        .put("honorifics", new JSONObject(stringMap.toString())))
                 .put("additionalProperties", false);
         return new JSONObject()
                 .put("type", "object")
                 .put("properties", new JSONObject()
                         .put("blocks", new JSONObject()
                                 .put("type", "array")
-                                .put("maxItems", MAX_TRANSLATION_BLOCKS)
                                 .put("items", block))
                         .put("memory_updates", memory))
                 .put("required", new JSONArray().put("blocks").put("memory_updates"))
                 .put("additionalProperties", false);
+    }
+
+    static JSONObject buildGeminiGenerationConfig(String model) throws Exception {
+        JSONObject config = new JSONObject().put("maxOutputTokens", MAX_OUTPUT_TOKENS);
+        if (normalizeModelId(model).startsWith("gemini-3")) {
+            // The Gemini Developer API uses one responseFormat object and an IANA MIME string.
+            config.put("responseFormat", new JSONObject()
+                    .put("text", new JSONObject()
+                            .put("mimeType", "application/json")
+                            .put("schema", translationJsonSchema())));
+        } else {
+            config.put("responseMimeType", "application/json")
+                    .put("responseJsonSchema", translationJsonSchema());
+        }
+        return config;
+    }
+
+    static JSONObject buildVertexGenerationConfig(String model) throws Exception {
+        JSONObject config = new JSONObject().put("maxOutputTokens", MAX_OUTPUT_TOKENS);
+        if (normalizeModelId(model).startsWith("gemini-3")) {
+            // Vertex AI v1 differs from the Developer API: responseFormat is an array and
+            // TextResponseFormat.mimeType is the APPLICATION_JSON enum value.
+            config.put("responseFormat", new JSONArray().put(new JSONObject()
+                    .put("text", new JSONObject()
+                            .put("mimeType", "APPLICATION_JSON")
+                            .put("schema", translationJsonSchema()))));
+        } else {
+            config.put("responseMimeType", "application/json")
+                    .put("responseJsonSchema", translationJsonSchema());
+        }
+        return config;
+    }
+
+    static String normalizeModelId(String value) {
+        String model = value == null ? "" : value.trim().toLowerCase(Locale.ROOT);
+        while (model.endsWith("/")) model = model.substring(0, model.length() - 1);
+        int slash = model.lastIndexOf('/');
+        return slash >= 0 ? model.substring(slash + 1) : model;
+    }
+
+    static String normalizeVertexLocation(String value) {
+        String location = value == null ? "" : value.trim().toLowerCase(Locale.ROOT);
+        return location.isEmpty() ? "global" : location;
+    }
+
+    static String vertexEndpointHost(String locationValue) {
+        String location = normalizeVertexLocation(locationValue);
+        if ("global".equals(location)) return "aiplatform.googleapis.com";
+        if ("us".equals(location) || "eu".equals(location)) {
+            return "aiplatform." + location + ".rep.googleapis.com";
+        }
+        return location + "-aiplatform.googleapis.com";
+    }
+
+    static void validateVertexModelLocation(String modelValue, String locationValue) {
+        String model = normalizeModelId(modelValue);
+        String location = normalizeVertexLocation(locationValue);
+        if (model.startsWith("gemini-3.7-flash")
+                && !"global".equals(location)
+                && !"us".equals(location)
+                && !"eu".equals(location)) {
+            throw new IllegalArgumentException(
+                    "gemini-3.7-flash의 Vertex AI 리전은 global, us 또는 eu만 지원합니다. global을 권장합니다.");
+        }
     }
 
     private static String parseOpenAiText(JSONObject response) {
@@ -293,7 +367,7 @@ public final class TranslationClient {
                                                      RetryListener retryListener) throws Exception {
         require(apiKey, "Gemini API 키가 설정되지 않았습니다.");
         require(settings.geminiModel(), "Gemini 모델명이 비어 있습니다.");
-        String model = settings.geminiModel().replace("models/", "");
+        String model = normalizeModelId(settings.geminiModel());
         String endpoint = "https://generativelanguage.googleapis.com/v1beta/models/"
                 + urlPath(model) + ":generateContent";
 
@@ -305,17 +379,7 @@ public final class TranslationClient {
                 .put(new JSONObject().put("inline_data", inline));
         JSONObject systemInstruction = new JSONObject()
                 .put("parts", new JSONArray().put(new JSONObject().put("text", systemPrompt)));
-        JSONObject generationConfig = new JSONObject()
-                .put("maxOutputTokens", MAX_OUTPUT_TOKENS);
-        if (model.startsWith("gemini-3")) {
-            generationConfig.put("responseFormat", new JSONObject()
-                    .put("text", new JSONObject()
-                            .put("mimeType", "application/json")
-                            .put("schema", translationJsonSchema())));
-        } else {
-            generationConfig.put("responseMimeType", "application/json")
-                    .put("responseJsonSchema", translationJsonSchema());
-        }
+        JSONObject generationConfig = buildGeminiGenerationConfig(model);
         JSONObject body = new JSONObject()
                 .put("system_instruction", systemInstruction)
                 .put("contents", new JSONArray().put(new JSONObject().put("role", "user").put("parts", parts)))
@@ -330,7 +394,8 @@ public final class TranslationClient {
                                                      ApiSettings settings, String serviceJsonText,
                                                      RetryListener retryListener) throws Exception {
         require(serviceJsonText, "Vertex AI 서비스 계정 JSON을 불러오지 않았습니다.");
-        require(settings.vertexModel(), "Vertex AI 모델명이 비어 있습니다.");
+        String model = normalizeModelId(settings.vertexModel());
+        require(model, "Vertex AI 모델명이 비어 있습니다.");
         JSONObject service = new JSONObject(serviceJsonText);
         String clientEmail = service.getString("client_email");
         String privateKey = service.getString("private_key");
@@ -339,17 +404,16 @@ public final class TranslationClient {
         String project = settings.vertexProject().trim();
         if (project.isEmpty()) project = service.optString("project_id", "");
         require(project, "Vertex AI 프로젝트 ID가 없습니다.");
-        String location = settings.vertexLocation().trim().isEmpty() ? "global" : settings.vertexLocation().trim();
+        String location = normalizeVertexLocation(settings.vertexLocation());
         if (!location.matches("[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")) {
             throw new IllegalArgumentException("Vertex AI 리전 형식이 올바르지 않습니다.");
         }
+        validateVertexModelLocation(model, location);
         String token = getAccessToken(clientEmail, privateKey, tokenUri);
-        String host = "global".equalsIgnoreCase(location)
-                ? "aiplatform.googleapis.com"
-                : location + "-aiplatform.googleapis.com";
+        String host = vertexEndpointHost(location);
         String endpoint = "https://" + host + "/v1/projects/" + urlPath(project)
                 + "/locations/" + urlPath(location)
-                + "/publishers/google/models/" + urlPath(settings.vertexModel()) + ":generateContent";
+                + "/publishers/google/models/" + urlPath(model) + ":generateContent";
 
         JSONObject inline = new JSONObject()
                 .put("mimeType", image.mimeType)
@@ -362,10 +426,7 @@ public final class TranslationClient {
         JSONObject body = new JSONObject()
                 .put("systemInstruction", systemInstruction)
                 .put("contents", new JSONArray().put(new JSONObject().put("role", "user").put("parts", parts)))
-                .put("generationConfig", new JSONObject()
-                        .put("maxOutputTokens", MAX_OUTPUT_TOKENS)
-                        .put("responseMimeType", "application/json")
-                        .put("responseJsonSchema", translationJsonSchema()));
+                .put("generationConfig", buildVertexGenerationConfig(model));
         Map<String, String> headers = new HashMap<>();
         headers.put("Authorization", "Bearer " + token);
         JSONObject response;
@@ -710,19 +771,47 @@ public final class TranslationClient {
         return result.toString();
     }
 
-    private static String extractError(String body) {
+    static String extractError(String body) {
         try {
             JSONObject json = new JSONObject(body);
             Object error = json.opt("error");
             if (error instanceof JSONObject) {
-                String message = ((JSONObject) error).optString("message", "");
-                if (!message.isEmpty()) return message;
+                JSONObject errorObject = (JSONObject) error;
+                StringBuilder message = new StringBuilder(errorObject.optString("message", "").trim());
+                JSONArray details = errorObject.optJSONArray("details");
+                if (details != null) {
+                    for (int i = 0; i < details.length(); i++) {
+                        JSONObject detail = details.optJSONObject(i);
+                        JSONArray violations = detail == null
+                                ? null : detail.optJSONArray("fieldViolations");
+                        if (violations == null) continue;
+                        for (int j = 0; j < violations.length(); j++) {
+                            JSONObject violation = violations.optJSONObject(j);
+                            if (violation == null) continue;
+                            String field = violation.optString("field", "").trim();
+                            String description = violation.optString("description", "").trim();
+                            if (field.isEmpty() && description.isEmpty()) continue;
+                            if (message.length() > 0) message.append(" · ");
+                            if (!field.isEmpty()) message.append(field);
+                            if (!field.isEmpty() && !description.isEmpty()) message.append(": ");
+                            message.append(description);
+                            if (message.length() >= 700) break;
+                        }
+                        if (message.length() >= 700) break;
+                    }
+                }
+                if (message.length() > 0) return limitErrorMessage(message.toString());
             }
-            if (error instanceof String) return (String) error;
+            if (error instanceof String) return limitErrorMessage((String) error);
             String message = json.optString("message", "");
-            if (!message.isEmpty()) return message;
+            if (!message.isEmpty()) return limitErrorMessage(message);
         } catch (Exception ignored) {}
         String trimmed = body == null ? "" : body.trim();
+        return limitErrorMessage(trimmed);
+    }
+
+    private static String limitErrorMessage(String value) {
+        String trimmed = value == null ? "" : value.trim();
         return trimmed.length() > 700 ? trimmed.substring(0, 700) + "…" : trimmed;
     }
 

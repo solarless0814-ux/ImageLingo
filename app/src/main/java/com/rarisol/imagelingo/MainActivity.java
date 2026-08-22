@@ -1536,7 +1536,7 @@ public final class MainActivity extends ComponentActivity {
 
         form.addView(section("Vertex AI"));
         EditText vertexModel = field("모델명", apiSettings.vertexModel());
-        EditText vertexLocation = field("리전 · global, us-central1 등", apiSettings.vertexLocation());
+        EditText vertexLocation = field("리전 · global 권장, us 또는 eu", apiSettings.vertexLocation());
         EditText vertexProject = field("프로젝트 ID", apiSettings.vertexProject());
         form.addView(vertexModel, fieldParams());
         form.addView(vertexLocation, fieldParams());
