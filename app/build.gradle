@@ -2,27 +2,105 @@ plugins {
     id 'com.android.application'
 }
 
+// Release signing is intentionally supplied at build time. Keeping credentials
+// outside the repository lets the same Gradle file work locally and in CI.
+def releaseSigning = [
+        storeFile    : providers.environmentVariable('IMAGELINGO_KEYSTORE_PATH')
+                .orElse(providers.gradleProperty('IMAGELINGO_KEYSTORE_PATH')).orNull,
+        storePassword: providers.environmentVariable('IMAGELINGO_KEYSTORE_PASSWORD')
+                .orElse(providers.gradleProperty('IMAGELINGO_KEYSTORE_PASSWORD')).orNull,
+        keyAlias     : providers.environmentVariable('IMAGELINGO_KEY_ALIAS')
+                .orElse(providers.gradleProperty('IMAGELINGO_KEY_ALIAS')).orNull,
+        keyPassword  : providers.environmentVariable('IMAGELINGO_KEY_PASSWORD')
+                .orElse(providers.gradleProperty('IMAGELINGO_KEY_PASSWORD')).orNull
+]
+
+def configuredSigningValues = releaseSigning.values().count {
+    it != null && !it.toString().trim().isEmpty()
+}
+if (configuredSigningValues > 0 && configuredSigningValues < releaseSigning.size()) {
+    throw new GradleException('Release signing requires all four IMAGELINGO_KEYSTORE_* / IMAGELINGO_KEY_* values.')
+}
+def hasReleaseSigning = configuredSigningValues == releaseSigning.size()
+
 android {
-    namespace 'com.rarisol.imagelingo'
-    compileSdk 35
+    namespace = 'com.rarisol.imagelingo'
+    compileSdk = 36
 
     defaultConfig {
-        applicationId 'com.rarisol.imagelingo'
-        minSdk 28
-        targetSdk 35
-        versionCode 10
-        versionName '0.9.0'
+        applicationId = 'com.rarisol.imagelingo'
+        minSdk = 28
+        targetSdk = 36
+
+        // versionCode scheme: major * 10000 + minor * 100 + patch
+        versionCode = 10000
+        versionName = '1.0.0'
+    }
+
+    signingConfigs {
+        if (hasReleaseSigning) {
+            release {
+                storeFile = file(releaseSigning.storeFile)
+                storePassword = releaseSigning.storePassword
+                keyAlias = releaseSigning.keyAlias
+                keyPassword = releaseSigning.keyPassword
+                enableV1Signing = true
+                enableV2Signing = true
+                enableV3Signing = true
+                enableV4Signing = false
+            }
+        }
     }
 
     buildTypes {
+        debug {
+            applicationIdSuffix = '.debug'
+            versionNameSuffix = '-debug'
+        }
         release {
-            minifyEnabled false
+            minifyEnabled = true
+            shrinkResources = true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.release
+            }
         }
     }
 
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
+    }
+
+    packaging {
+        resources {
+            excludes += [
+                    'META-INF/DEPENDENCIES',
+                    'META-INF/LICENSE*',
+                    'META-INF/NOTICE*'
+            ]
+        }
+    }
+}
+
+dependencies {
+    implementation 'androidx.activity:activity:1.13.0'
+    testImplementation 'junit:junit:4.13.2'
+}
+
+// CI and release scripts use these tasks instead of parsing this file.
+tasks.register('printVersionName') {
+    group = 'help'
+    description = 'Prints the canonical app version name.'
+    doLast {
+        println android.defaultConfig.versionName
+    }
+}
+
+tasks.register('printVersionCode') {
+    group = 'help'
+    description = 'Prints the canonical app version code.'
+    doLast {
+        println android.defaultConfig.versionCode
     }
 }

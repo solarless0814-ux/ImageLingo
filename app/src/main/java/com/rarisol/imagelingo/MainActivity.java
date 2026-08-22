@@ -1,23 +1,28 @@
 package com.rarisol.imagelingo;
 
-import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.UriPermission;
+import android.content.res.ColorStateList;
+import android.content.res.Configuration;
 import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.ImageDecoder;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.RippleDrawable;
 import android.net.Uri;
 import android.os.Bundle;
 import android.text.InputType;
 import android.util.Size;
 import android.view.Gravity;
+import android.view.DisplayCutout;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.WindowInsets;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.EditText;
@@ -29,6 +34,11 @@ import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import androidx.activity.ComponentActivity;
+import androidx.activity.OnBackPressedCallback;
+import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
+
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
@@ -39,17 +49,21 @@ import java.text.NumberFormat;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
 
-public final class MainActivity extends Activity {
-    private static final int REQUEST_FOLDER = 1001;
-    private static final int REQUEST_VERTEX_JSON = 1002;
+public final class MainActivity extends ComponentActivity {
     private static final String APP_PREFS = "app_state";
     private static final String OUTPUT_DIR_NAME = "ImageLingo_Translated";
+    private static final int MAX_DISPLAY_EDGE = 2560;
+    private static final long MAX_DISPLAY_PIXELS = 6_000_000L;
+    private static final int MAX_OUTPUT_EDGE = 4096;
+    private static final long MAX_OUTPUT_PIXELS = 10_000_000L;
 
     private static final int COLOR_BG = 0xFF080A0F;
     private static final int COLOR_SURFACE = 0xF21A1D27;
@@ -60,15 +74,23 @@ public final class MainActivity extends Activity {
     private static final int COLOR_MUTED = 0xFFA8ADBC;
     private static final int COLOR_STROKE = 0xFF343947;
 
-    private final ExecutorService executor = Executors.newFixedThreadPool(2);
+    private final ExecutorService displayExecutor = Executors.newSingleThreadExecutor();
+    private final ExecutorService batchExecutor = Executors.newSingleThreadExecutor();
+    private final ExecutorService ioExecutor = Executors.newSingleThreadExecutor();
     private final AtomicInteger imageLoadVersion = new AtomicInteger();
+    private final AtomicInteger folderLoadVersion = new AtomicInteger();
     private final Map<String, TranslationClient.TranslationResult> translationCache = new ConcurrentHashMap<>();
     private final Map<String, Uri> translatedOutputMap = new ConcurrentHashMap<>();
+    private Future<?> imageLoadTask;
+    private Future<?> batchTask;
+    private ActivityResultLauncher<Intent> folderPickerLauncher;
+    private ActivityResultLauncher<Intent> vertexJsonPickerLauncher;
 
     private ZoomImageView imageView;
     private TextView titleView;
     private TextView subtitleView;
     private TextView progressTextView;
+    private ProgressBar folderProgressBar;
     private ProgressBar progressBar;
     private LinearLayout translationPanel;
     private TextView translationTitle;
@@ -79,6 +101,7 @@ public final class MainActivity extends Activity {
     private Button stopButton;
     private Button modeButton;
     private TextView vertexStatusText;
+    private FrameLayout rootView;
 
     private List<ImageRepository.ImageEntry> allImages = new ArrayList<>();
     private List<ImageRepository.ImageEntry> images = new ArrayList<>();
@@ -93,21 +116,36 @@ public final class MainActivity extends Activity {
     private volatile String processingImageUri;
     private volatile int processingPageNumber;
     private volatile TranslationMemory translationMemory;
+    private volatile TranslationManifest translationManifest;
     private volatile Uri outputDirectoryUri;
     private final Object rateLimitPauseLock = new Object();
     private volatile boolean rateLimitPaused;
     private volatile String rateLimitPauseMessage = "";
     private boolean translatedOnlyMode;
     private String currentTranslationText = "";
+    private final OnBackPressedCallback backPressedCallback = new OnBackPressedCallback(true) {
+        @Override public void handleOnBackPressed() {
+            handleBackPressed();
+        }
+    };
 
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         getWindow().setStatusBarColor(COLOR_BG);
         getWindow().setNavigationBarColor(COLOR_BG);
+        getWindow().setNavigationBarDividerColor(COLOR_BG);
+        getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
         apiSettings = new ApiSettings(this);
         secureStore = new SecureStore(this);
         appPrefs = getSharedPreferences(APP_PREFS, MODE_PRIVATE);
         translatedOnlyMode = appPrefs.getBoolean("translated_only_mode", false);
+        folderPickerLauncher = registerForActivityResult(
+                new ActivityResultContracts.StartActivityForResult(),
+                result -> handleFolderPickerResult(result.getResultCode(), result.getData()));
+        vertexJsonPickerLauncher = registerForActivityResult(
+                new ActivityResultContracts.StartActivityForResult(),
+                result -> handleVertexJsonPickerResult(result.getResultCode(), result.getData()));
+        getOnBackPressedDispatcher().addCallback(this, backPressedCallback);
         buildUi();
 
         String savedTree = appPrefs.getString("tree_uri", "");
@@ -118,17 +156,26 @@ public final class MainActivity extends Activity {
         }
     }
 
+    @Override public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        if (rootView != null) {
+            rootView.post(rootView::requestApplyInsets);
+        }
+    }
+
     private void buildUi() {
-        FrameLayout root = new FrameLayout(this);
+        rootView = new FrameLayout(this);
+        FrameLayout root = rootView;
         root.setBackgroundColor(COLOR_BG);
 
         imageView = new ZoomImageView(this);
         imageView.setBackgroundColor(COLOR_BG);
+        imageView.setContentDescription("이미지 없음 · 폴더를 선택하세요");
         imageView.setPageSwipeListener(this::movePage);
 
         FrameLayout.LayoutParams imageParams = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
-        imageParams.topMargin = dp(104);
+        imageParams.topMargin = dp(126);
         imageParams.bottomMargin = dp(84);
         root.addView(imageView, imageParams);
 
@@ -141,6 +188,15 @@ public final class MainActivity extends Activity {
 
         Button folderButton = makeToolbarButton("폴더");
         folderButton.setOnClickListener(v -> chooseFolder());
+        folderButton.setContentDescription("이미지 폴더 선택");
+        folderButton.setOnLongClickListener(v -> {
+            if (currentTreeUri != null && !batchRunning) {
+                loadFolder(currentTreeUri);
+                Toast.makeText(this, "현재 폴더를 새로고침합니다.", Toast.LENGTH_SHORT).show();
+                return true;
+            }
+            return false;
+        });
 
         LinearLayout titleGroup = new LinearLayout(this);
         titleGroup.setOrientation(LinearLayout.VERTICAL);
@@ -151,37 +207,54 @@ public final class MainActivity extends Activity {
         titleView.setTypeface(Typeface.DEFAULT_BOLD);
         titleView.setGravity(Gravity.CENTER);
         titleView.setSingleLine(true);
+        titleView.setAccessibilityHeading(true);
         subtitleView = new TextView(this);
         subtitleView.setTextColor(COLOR_MUTED);
-        subtitleView.setTextSize(10.5f);
+        subtitleView.setTextSize(12f);
         subtitleView.setGravity(Gravity.CENTER);
         subtitleView.setSingleLine(true);
         progressTextView = new TextView(this);
         progressTextView.setTextColor(0xFF9FC4FF);
-        progressTextView.setTextSize(10.5f);
+        progressTextView.setTextSize(12f);
         progressTextView.setTypeface(Typeface.DEFAULT_BOLD);
         progressTextView.setGravity(Gravity.CENTER);
         progressTextView.setSingleLine(true);
+        progressTextView.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        folderProgressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        folderProgressBar.setMax(100);
+        folderProgressBar.setProgress(0);
+        folderProgressBar.setProgressTintList(ColorStateList.valueOf(COLOR_PRIMARY_2));
+        folderProgressBar.setProgressBackgroundTintList(ColorStateList.valueOf(0xFF2B3040));
+        folderProgressBar.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
         titleGroup.addView(titleView, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         titleGroup.addView(subtitleView, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         titleGroup.addView(progressTextView, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        LinearLayout.LayoutParams folderProgressParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(3));
+        folderProgressParams.setMargins(dp(12), dp(3), dp(12), 0);
+        titleGroup.addView(folderProgressBar, folderProgressParams);
 
         LinearLayout rightControls = new LinearLayout(this);
         rightControls.setOrientation(LinearLayout.VERTICAL);
         rightControls.setGravity(Gravity.CENTER);
         Button settingsButton = makeToolbarButton("설정");
+        settingsButton.setContentDescription("번역 API와 모델 설정");
         settingsButton.setOnClickListener(v -> showSettingsDialog());
         modeButton = makeToolbarButton(translatedOnlyMode ? "전체 보기" : "번역본만");
-        modeButton.setTextSize(11f);
+        modeButton.setTextSize(12f);
         modeButton.setOnClickListener(v -> toggleTranslatedOnlyMode());
-        LinearLayout.LayoutParams rightButtonParams = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
-        rightButtonParams.setMargins(0, dp(1), 0, dp(1));
-        rightControls.addView(settingsButton, rightButtonParams);
-        rightControls.addView(modeButton, rightButtonParams);
+        updateModeButtonAppearance();
+        LinearLayout.LayoutParams settingsButtonParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(48));
+        settingsButtonParams.setMargins(0, dp(1), 0, dp(1));
+        LinearLayout.LayoutParams modeButtonParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(48));
+        modeButtonParams.setMargins(0, dp(1), 0, dp(1));
+        rightControls.addView(settingsButton, settingsButtonParams);
+        rightControls.addView(modeButton, modeButtonParams);
 
         topBar.addView(folderButton, new LinearLayout.LayoutParams(dp(66), ViewGroup.LayoutParams.MATCH_PARENT));
         topBar.addView(titleGroup, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
@@ -190,7 +263,7 @@ public final class MainActivity extends Activity {
         topBar.addView(rightControls, rightParams);
 
         FrameLayout.LayoutParams topParams = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(90), Gravity.TOP);
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(112), Gravity.TOP);
         topParams.setMargins(dp(12), dp(8), dp(12), 0);
         root.addView(topBar, topParams);
 
@@ -203,13 +276,28 @@ public final class MainActivity extends Activity {
 
         Button previous = makeNavButton("〈  이전");
         previous.setOnClickListener(v -> movePage(-1));
+        previous.setOnLongClickListener(v -> jumpToPage(0));
+        previous.setContentDescription("이전 이미지 · 길게 눌러 첫 이미지로 이동");
         translateButton = makePrimaryButton("폴더 번역");
+        translateButton.setContentDescription("폴더 번역 · 길게 누르면 기존 번역본도 모두 다시 번역");
         translateButton.setOnClickListener(v -> {
             if (rateLimitPaused) resumeRateLimitPause();
-            else translateFolder();
+            else translateFolder(false);
+        });
+        translateButton.setOnLongClickListener(v -> {
+            if (rateLimitPaused || batchRunning) return true;
+            new AlertDialog.Builder(this)
+                    .setTitle("폴더 전체 다시 번역")
+                    .setMessage("현재 번역본도 모두 API로 다시 보내고 덮어씁니다. 추가 사용량과 비용이 발생할 수 있습니다.")
+                    .setNegativeButton("취소", null)
+                    .setPositiveButton("모두 다시 번역", (dialog, which) -> translateFolder(true))
+                    .show();
+            return true;
         });
         Button next = makeNavButton("다음  〉");
         next.setOnClickListener(v -> movePage(1));
+        next.setOnLongClickListener(v -> jumpToPage(images.size() - 1));
+        next.setContentDescription("다음 이미지 · 길게 눌러 마지막 이미지로 이동");
 
         LinearLayout.LayoutParams navParams = new LinearLayout.LayoutParams(0,
                 ViewGroup.LayoutParams.MATCH_PARENT, 1f);
@@ -232,6 +320,7 @@ public final class MainActivity extends Activity {
         translationPanel.setBackground(roundedTopBackground(0xFA151821, 26, COLOR_STROKE));
         translationPanel.setElevation(dp(14));
         translationPanel.setVisibility(View.GONE);
+        translationPanel.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
 
         LinearLayout panelHeader = new LinearLayout(this);
         panelHeader.setOrientation(LinearLayout.HORIZONTAL);
@@ -243,18 +332,19 @@ public final class MainActivity extends Activity {
         translationTitle.setTextColor(0xFFBFD5FF);
         translationTitle.setTextSize(15f);
         translationTitle.setTypeface(Typeface.DEFAULT_BOLD);
+        translationTitle.setAccessibilityHeading(true);
         TextView panelCaption = new TextView(this);
         panelCaption.setText("안내");
         panelCaption.setTextColor(COLOR_MUTED);
-        panelCaption.setTextSize(11f);
+        panelCaption.setTextSize(12f);
         panelTitleGroup.addView(translationTitle);
         panelTitleGroup.addView(panelCaption);
 
         Button close = makePanelButton("닫기");
-        close.setOnClickListener(v -> translationPanel.setVisibility(View.GONE));
+        close.setOnClickListener(v -> hideTranslationPanel());
 
         panelHeader.addView(panelTitleGroup, new LinearLayout.LayoutParams(0, dp(50), 1f));
-        LinearLayout.LayoutParams panelButtonParams = new LinearLayout.LayoutParams(dp(62), dp(38));
+        LinearLayout.LayoutParams panelButtonParams = new LinearLayout.LayoutParams(dp(68), dp(48));
         panelButtonParams.setMargins(dp(5), 0, 0, 0);
         panelHeader.addView(close, panelButtonParams);
         translationPanel.addView(panelHeader);
@@ -279,20 +369,22 @@ public final class MainActivity extends Activity {
         translationPanel.addView(scroll, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
+        int panelHeight = calculatePanelHeight(getResources().getDisplayMetrics().heightPixels);
         FrameLayout.LayoutParams panelParams = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(300), Gravity.BOTTOM);
+                ViewGroup.LayoutParams.MATCH_PARENT, panelHeight, Gravity.BOTTOM);
         panelParams.setMargins(dp(8), 0, dp(8), dp(82));
         root.addView(translationPanel, panelParams);
 
         tokenBadge = new TextView(this);
         tokenBadge.setTextColor(COLOR_TEXT);
-        tokenBadge.setTextSize(11f);
+        tokenBadge.setTextSize(13f);
         tokenBadge.setTypeface(Typeface.DEFAULT_BOLD);
         tokenBadge.setGravity(Gravity.CENTER);
         tokenBadge.setPadding(dp(12), dp(7), dp(12), dp(7));
         tokenBadge.setBackground(roundedBackground(0xF22A2E3B, 18, 0xFF4A5060));
         tokenBadge.setElevation(dp(18));
         tokenBadge.setVisibility(View.GONE);
+        tokenBadge.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
         FrameLayout.LayoutParams tokenParams = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
                 Gravity.BOTTOM | Gravity.END);
@@ -303,7 +395,7 @@ public final class MainActivity extends Activity {
         copyButton.setVisibility(View.GONE);
         copyButton.setOnClickListener(v -> copyTranslation());
         FrameLayout.LayoutParams leftButtonParams = new FrameLayout.LayoutParams(
-                dp(112), dp(38), Gravity.BOTTOM | Gravity.START);
+                dp(120), dp(48), Gravity.BOTTOM | Gravity.START);
         leftButtonParams.setMargins(dp(20), 0, 0, dp(94));
         root.addView(copyButton, leftButtonParams);
 
@@ -311,7 +403,7 @@ public final class MainActivity extends Activity {
         stopButton.setVisibility(View.GONE);
         stopButton.setOnClickListener(v -> requestStopBatch());
         FrameLayout.LayoutParams stopParams = new FrameLayout.LayoutParams(
-                dp(112), dp(38), Gravity.BOTTOM | Gravity.START);
+                dp(120), dp(48), Gravity.BOTTOM | Gravity.START);
         stopParams.setMargins(dp(20), 0, 0, dp(94));
         root.addView(stopButton, stopParams);
 
@@ -320,24 +412,35 @@ public final class MainActivity extends Activity {
         FrameLayout.LayoutParams progressParams = new FrameLayout.LayoutParams(dp(54), dp(54), Gravity.CENTER);
         root.addView(progressBar, progressParams);
 
+        root.setOnApplyWindowInsetsListener((view, insets) -> {
+            applySystemBarInsets(insets, imageParams, topParams, bottomParams, panelParams,
+                    tokenParams, leftButtonParams, stopParams);
+            return insets;
+        });
         setContentView(root);
+        root.requestApplyInsets();
     }
 
     private void showWelcome() {
         titleView.setText("ImageLingo");
         subtitleView.setText("AI 이미지 번역 리더");
         progressTextView.setText("번역 0 / 0 · 0%");
+        folderProgressBar.setProgress(0, true);
         translationTitle.setText("시작하기");
         translationTitle.setTextColor(0xFFBFD5FF);
         translationText.setText("상단의 ‘폴더’를 눌러 이미지가 들어 있는 폴더를 선택하세요.\n\n"
                 + "‘설정’에서 Gemini, OpenAI 또는 Vertex AI 인증 정보와 시스템 프롬프트를 입력한 뒤, 하단의 ‘폴더 번역’을 누르면 선택한 폴더 전체가 순차적으로 번역됩니다.\n\n"
-                + "이미 번역된 PNG가 ‘" + OUTPUT_DIR_NAME + "’ 폴더에 있으면 자동으로 건너뜁니다.\n"
-                + "번역된 이미지는 원문 위에 반투명 박스와 한국어 텍스트가 합성된 PNG 파일로 저장됩니다.");
+                + "원본 정보와 현재 번역 설정이 일치하는 PNG가 ‘" + OUTPUT_DIR_NAME
+                + "’ 폴더에 있으면 자동으로 건너뜁니다.\n"
+                + "번역된 이미지는 원문 위에 반투명 박스와 한국어 텍스트가 합성된 PNG 파일로 저장됩니다.\n\n"
+                + "이미지·시스템 프롬프트·폴더 문맥은 선택한 외부 API로 전송되며 계정에 사용량과 비용이 발생할 수 있습니다. "
+                + "문맥과 manifest JSON은 선택 폴더에 암호화되지 않은 파일로 저장됩니다.");
         tokenBadge.setVisibility(View.GONE);
         copyButton.setVisibility(View.GONE);
         stopButton.setVisibility(View.GONE);
         currentTranslationText = "";
-        translationPanel.setVisibility(View.VISIBLE);
+        imageView.setContentDescription("이미지 없음 · 폴더를 선택하세요");
+        showTranslationPanel();
     }
 
     private void chooseFolder() {
@@ -350,35 +453,67 @@ public final class MainActivity extends Activity {
                 | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
                 | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION
                 | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
-        startActivityForResult(intent, REQUEST_FOLDER);
+        folderPickerLauncher.launch(intent);
     }
 
     private void chooseVertexJson() {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
         intent.setType("application/json");
-        startActivityForResult(intent, REQUEST_VERTEX_JSON);
+        vertexJsonPickerLauncher.launch(intent);
     }
 
-    @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
-        super.onActivityResult(requestCode, resultCode, data);
+    private void handleFolderPickerResult(int resultCode, Intent data) {
         if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
         Uri uri = data.getData();
-        if (requestCode == REQUEST_FOLDER) {
-            try {
-                int flags = data.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION
-                        | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
-                getContentResolver().takePersistableUriPermission(uri, flags);
-            } catch (Exception ignored) {}
-            appPrefs.edit().putString("tree_uri", uri.toString()).apply();
+        Uri previousTree = currentTreeUri;
+        try {
+            int flags = data.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+            int requiredFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    | Intent.FLAG_GRANT_WRITE_URI_PERMISSION;
+            if ((flags & requiredFlags) != requiredFlags) {
+                throw new SecurityException("선택한 폴더의 읽기·쓰기 권한을 모두 받아야 합니다.");
+            }
+            getContentResolver().takePersistableUriPermission(uri, requiredFlags);
+            if (!appPrefs.edit().putString("tree_uri", uri.toString()).commit()) {
+                if (!uri.equals(previousTree)) releasePersistedTreePermission(uri);
+                throw new IllegalStateException("선택한 폴더를 앱 설정에 저장하지 못했습니다.");
+            }
+            if (previousTree != null && !previousTree.equals(uri)) {
+                releasePersistedTreePermission(previousTree);
+            }
             loadFolder(uri);
-        } else if (requestCode == REQUEST_VERTEX_JSON) {
-            importVertexJson(uri);
+        } catch (Exception permissionError) {
+            Toast.makeText(this, "폴더 권한 오류: " + cleanMessage(permissionError),
+                    Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void handleVertexJsonPickerResult(int resultCode, Intent data) {
+        if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
+        importVertexJson(data.getData());
+    }
+
+    private void releasePersistedTreePermission(Uri treeUri) {
+        if (treeUri == null) return;
+        for (UriPermission permission : getContentResolver().getPersistedUriPermissions()) {
+            if (!treeUri.equals(permission.getUri())) continue;
+            int flags = 0;
+            if (permission.isReadPermission()) flags |= Intent.FLAG_GRANT_READ_URI_PERMISSION;
+            if (permission.isWritePermission()) flags |= Intent.FLAG_GRANT_WRITE_URI_PERMISSION;
+            if (flags == 0) return;
+            try {
+                getContentResolver().releasePersistableUriPermission(treeUri, flags);
+            } catch (SecurityException ignored) {
+                // The provider may already have revoked the old grant.
+            }
+            return;
         }
     }
 
     private void importVertexJson(Uri uri) {
-        executor.execute(() -> {
+        ioExecutor.execute(() -> {
             try {
                 String jsonText = readUtf8(uri, 2_000_000);
                 JSONObject json = new JSONObject(jsonText);
@@ -389,6 +524,7 @@ public final class MainActivity extends Activity {
                     throw new IllegalArgumentException("client_email 또는 private_key가 없습니다.");
                 }
                 secureStore.put("vertex_json", jsonText);
+                TranslationClient.clearCachedCredentials();
                 String project = json.optString("project_id", "");
                 if (!project.isEmpty()) {
                     apiSettings.save(apiSettings.provider(), apiSettings.openAiModel(), apiSettings.openAiEndpoint(),
@@ -396,17 +532,35 @@ public final class MainActivity extends Activity {
                             project, apiSettings.systemPrompt());
                 }
                 runOnUiThread(() -> {
+                    if (!isActivityAlive()) return;
                     if (vertexStatusText != null) vertexStatusText.setText("불러옴: " + json.optString("client_email"));
                     Toast.makeText(this, "Vertex AI JSON을 암호화해 저장했습니다.", Toast.LENGTH_LONG).show();
                 });
             } catch (Exception e) {
-                runOnUiThread(() -> Toast.makeText(this, "JSON 오류: " + cleanMessage(e), Toast.LENGTH_LONG).show());
+                runOnUiThread(() -> {
+                    if (isActivityAlive()) {
+                        Toast.makeText(this, "JSON 오류: " + cleanMessage(e), Toast.LENGTH_LONG).show();
+                    }
+                });
             }
         });
     }
 
     private void loadFolder(Uri treeUri) {
+        final int loadVersion = folderLoadVersion.incrementAndGet();
         currentTreeUri = treeUri;
+        cancelImageLoadTask();
+        imageLoadVersion.incrementAndGet();
+        translationCache.clear();
+        allImages = new ArrayList<>();
+        images = new ArrayList<>();
+        currentIndex = -1;
+        outputDirectoryUri = null;
+        translationMemory = null;
+        translationManifest = null;
+        swapDisplayedBitmap(null);
+        translateButton.setEnabled(false);
+        translateButton.setAlpha(0.65f);
         progressBar.setVisibility(View.VISIBLE);
         titleView.setText("폴더 읽는 중…");
         subtitleView.setText("");
@@ -415,29 +569,52 @@ public final class MainActivity extends Activity {
         tokenBadge.setVisibility(View.GONE);
         translatedOutputMap.clear();
         currentTranslationText = "";
+        imageView.setContentDescription("폴더의 이미지 목록을 읽는 중");
         copyButton.setVisibility(View.GONE);
         stopButton.setVisibility(View.GONE);
-        executor.execute(() -> {
+        ioExecutor.execute(() -> {
             try {
                 List<ImageRepository.ImageEntry> loaded = ImageRepository.listImages(getContentResolver(), treeUri);
+                Map<String, String> outputNames = outputNamesFor(loaded);
                 Map<String, Uri> restoredOutputs = new HashMap<>();
                 Uri outputDir = ImageRepository.findSubdirectory(getContentResolver(), treeUri, OUTPUT_DIR_NAME);
                 TranslationMemory restoredMemory = TranslationMemory.load(getContentResolver(), outputDir);
+                TranslationManifest restoredManifest = TranslationManifest.load(
+                        getContentResolver(), outputDir);
+                Map<String, TranslationClient.TranslationResult> restoredTranslations = new HashMap<>();
                 if (outputDir != null) {
                     Map<String, Uri> outputsByName = ImageRepository.listImageDocumentsByName(
                             getContentResolver(), outputDir);
                     for (ImageRepository.ImageEntry entry : loaded) {
-                        Uri translated = outputsByName.get(outputNameFor(entry.name));
-                        if (translated != null) restoredOutputs.put(entry.uri.toString(), translated);
+                        String outputName = outputNames.get(entry.uri.toString());
+                        Uri translated = outputsByName.get(outputName);
+                        String fingerprint = outputFingerprint(entry);
+                        if (translated != null
+                                && restoredManifest.isCurrent(entry, outputName, fingerprint)) {
+                            restoredOutputs.put(entry.uri.toString(), translated);
+                            String resultText = restoredManifest.resultText(entry, fingerprint);
+                            if (!resultText.isEmpty()) {
+                                restoredTranslations.put(cacheKeyFor(entry),
+                                        new TranslationClient.TranslationResult(
+                                                resultText, null, null, null));
+                            }
+                        }
                     }
                 }
                 runOnUiThread(() -> {
+                    if (!isActivityAlive() || loadVersion != folderLoadVersion.get()
+                            || !treeUri.equals(currentTreeUri)) return;
                     progressBar.setVisibility(View.GONE);
                     allImages = loaded;
                     outputDirectoryUri = outputDir;
                     translationMemory = restoredMemory;
+                    translationManifest = restoredManifest;
+                    translationCache.clear();
+                    translationCache.putAll(restoredTranslations);
                     translatedOutputMap.clear();
                     translatedOutputMap.putAll(restoredOutputs);
+                    translateButton.setEnabled(!loaded.isEmpty());
+                    translateButton.setAlpha(loaded.isEmpty() ? 0.65f : 1f);
                     if (loaded.isEmpty()) {
                         images = new ArrayList<>();
                         currentIndex = -1;
@@ -447,14 +624,17 @@ public final class MainActivity extends Activity {
                         translationTitle.setText("폴더가 비어 있습니다");
                         translationTitle.setTextColor(0xFFBFD5FF);
                         translationText.setText("선택한 폴더의 바로 아래에서 JPG, PNG, WEBP 등의 이미지 파일을 찾지 못했습니다.");
-                        translationPanel.setVisibility(View.VISIBLE);
+                        showTranslationPanel();
                         imageView.setImageDrawable(null);
+                        imageView.setContentDescription("이미지 없음 · 다른 폴더를 선택하세요");
                     } else {
                         applyViewMode(null);
                     }
                 });
             } catch (Exception e) {
                 runOnUiThread(() -> {
+                    if (!isActivityAlive() || loadVersion != folderLoadVersion.get()
+                            || !treeUri.equals(currentTreeUri)) return;
                     progressBar.setVisibility(View.GONE);
                     titleView.setText("폴더 오류");
                     subtitleView.setText("");
@@ -472,6 +652,16 @@ public final class MainActivity extends Activity {
         applyViewMode(preferredUri);
     }
 
+    private void updateModeButtonAppearance() {
+        if (modeButton == null) return;
+        modeButton.setText(translatedOnlyMode ? "전체 보기" : "번역본만");
+        modeButton.setContentDescription(translatedOnlyMode
+                ? "전체 이미지 보기로 전환" : "저장된 번역본만 보기");
+        int color = translatedOnlyMode ? 0xFF37326B : COLOR_SURFACE_2;
+        int stroke = translatedOnlyMode ? 0xFF7167D9 : COLOR_STROKE;
+        modeButton.setBackground(rippleRoundedBackground(color, 14, stroke, 0x28FFFFFF));
+    }
+
     private void applyViewMode(String preferredUri) {
         List<ImageRepository.ImageEntry> next = new ArrayList<>();
         if (translatedOnlyMode) {
@@ -485,10 +675,11 @@ public final class MainActivity extends Activity {
             next.addAll(allImages);
         }
         images = next;
-        if (modeButton != null) modeButton.setText(translatedOnlyMode ? "전체 보기" : "번역본만");
+        updateModeButtonAppearance();
         updateTopProgress(processingPageNumber);
 
         if (images.isEmpty()) {
+            cancelImageLoadTask();
             imageLoadVersion.incrementAndGet();
             Bitmap old = currentBitmap;
             currentBitmap = null;
@@ -500,6 +691,8 @@ public final class MainActivity extends Activity {
             titleView.setText(translatedOnlyMode ? "번역본 없음" : "이미지 없음");
             subtitleView.setText(translatedOnlyMode
                     ? "폴더 번역을 먼저 실행하세요" : "다른 폴더를 선택하세요");
+            imageView.setContentDescription(translatedOnlyMode
+                    ? "저장된 번역 이미지 없음" : "이미지 없음 · 다른 폴더를 선택하세요");
             if (translatedOnlyMode) {
                 showResult("번역된 파일만 보기", "아직 저장된 번역본이 없습니다. ‘전체 보기’로 돌아가 폴더 번역을 실행하세요.", false);
             }
@@ -550,7 +743,7 @@ public final class MainActivity extends Activity {
             }
         }
         images = next;
-        modeButton.setText("전체 보기");
+        updateModeButtonAppearance();
         updateTopProgress(processingPageNumber);
         if (images.isEmpty()) {
             applyViewMode(preferredUri);
@@ -577,6 +770,7 @@ public final class MainActivity extends Activity {
         subtitleView.setText("번역본 " + (currentIndex + 1) + " / " + images.size()
                 + "  ·  " + providerLabel()
                 + (saved ? "  ·  저장됨" : processing ? "  ·  번역 중" : ""));
+        updateImageContentDescription(selected, saved, processing);
     }
 
     private int countTranslatedPages() {
@@ -591,6 +785,7 @@ public final class MainActivity extends Activity {
         int total = allImages.size();
         int translated = countTranslatedPages();
         int percent = total <= 0 ? 0 : Math.round(translated * 100f / total);
+        if (folderProgressBar != null) folderProgressBar.setProgress(percent, true);
         StringBuilder text = new StringBuilder();
         text.append("번역 완료 ").append(translated).append(" / ").append(total)
                 .append(" · ").append(percent).append("%");
@@ -606,8 +801,17 @@ public final class MainActivity extends Activity {
         progressTextView.setText(text.toString());
     }
 
+    private void updateImageContentDescription(ImageRepository.ImageEntry entry,
+                                               boolean saved, boolean processing) {
+        if (entry == null || imageView == null) return;
+        String state = saved ? "저장된 번역 이미지" : processing ? "번역 중인 원본 이미지" : "원본 이미지";
+        imageView.setContentDescription(entry.name + " · " + (currentIndex + 1) + " / "
+                + images.size() + " · " + state + " · 두 번 탭하여 확대하거나 좌우로 넘기세요");
+    }
+
     private void renderCurrent() {
         if (currentIndex < 0 || currentIndex >= images.size()) return;
+        cancelImageLoadTask();
         int version = imageLoadVersion.incrementAndGet();
         ImageRepository.ImageEntry entry = images.get(currentIndex);
         titleView.setText(entry.name);
@@ -619,18 +823,25 @@ public final class MainActivity extends Activity {
         updateTopProgress(processingPageNumber);
         progressBar.setVisibility(View.VISIBLE);
         translationPanel.setVisibility(View.GONE);
-        executor.execute(() -> {
+        currentTranslationText = "";
+        copyButton.setVisibility(View.GONE);
+        imageView.setContentDescription(entry.name + " · 이미지 불러오는 중");
+        imageLoadTask = displayExecutor.submit(() -> {
+            Bitmap decoded = null;
             try {
                 Uri displayUri = translatedOutputMap.get(entry.uri.toString());
-                Bitmap bitmap = decodeForDisplay(displayUri != null ? displayUri : entry.uri);
+                decoded = decodeForDisplay(displayUri != null ? displayUri : entry.uri);
+                if (Thread.currentThread().isInterrupted() || version != imageLoadVersion.get()) return;
                 String currentKey = cacheKeyFor(entry);
                 TranslationClient.TranslationResult cached = translationCache.get(currentKey);
+                Bitmap ready = decoded;
+                decoded = null;
                 runOnUiThread(() -> {
-                    if (version != imageLoadVersion.get()) {
-                        if (bitmap != null && !bitmap.isRecycled()) bitmap.recycle();
+                    if (!isActivityAlive() || version != imageLoadVersion.get()) {
+                        if (!ready.isRecycled()) ready.recycle();
                         return;
                     }
-                    swapDisplayedBitmap(bitmap);
+                    swapDisplayedBitmap(ready);
                     progressBar.setVisibility(View.GONE);
                     currentTranslationText = cached == null ? "" : cached.text;
                     copyButton.setVisibility(batchRunning || currentTranslationText.isEmpty() ? View.GONE : View.VISIBLE);
@@ -641,26 +852,51 @@ public final class MainActivity extends Activity {
                     subtitleView.setText((translatedOnlyMode ? "번역본 " : "")
                             + (currentIndex + 1) + " / " + images.size() + "  ·  " + providerLabel()
                             + (displayUri != null ? "  ·  저장됨" : processingNow ? "  ·  번역 중" : ""));
+                    updateImageContentDescription(entry, displayUri != null, processingNow);
                     updateTopProgress(processingPageNumber);
                 });
             } catch (Exception e) {
                 runOnUiThread(() -> {
+                    if (!isActivityAlive() || version != imageLoadVersion.get()) return;
                     progressBar.setVisibility(View.GONE);
+                    imageView.setContentDescription(entry.name + " · 이미지 불러오기 실패");
                     showResult("이미지 오류", cleanMessage(e), true);
                 });
+            } finally {
+                if (decoded != null && !decoded.isRecycled()) decoded.recycle();
             }
         });
     }
 
+    private void cancelImageLoadTask() {
+        Future<?> task = imageLoadTask;
+        imageLoadTask = null;
+        if (task != null && !task.isDone()) task.cancel(true);
+    }
+
     private Bitmap decodeForDisplay(Uri uri) throws Exception {
+        return decodeBitmap(uri, MAX_DISPLAY_EDGE, MAX_DISPLAY_PIXELS);
+    }
+
+    private Bitmap decodeForOutput(Uri uri) throws Exception {
+        return decodeBitmap(uri, MAX_OUTPUT_EDGE, MAX_OUTPUT_PIXELS);
+    }
+
+    private Bitmap decodeBitmap(Uri uri, int maximumEdge, long maximumPixels) throws Exception {
         ImageDecoder.Source source = ImageDecoder.createSource(getContentResolver(), uri);
         return ImageDecoder.decodeBitmap(source, (decoder, info, src) -> {
             Size size = info.getSize();
-            int max = Math.max(size.getWidth(), size.getHeight());
-            if (max > 3072) {
-                float ratio = 3072f / max;
-                decoder.setTargetSize(Math.max(1, Math.round(size.getWidth() * ratio)),
-                        Math.max(1, Math.round(size.getHeight() * ratio)));
+            int width = Math.max(1, size.getWidth());
+            int height = Math.max(1, size.getHeight());
+            int edge = Math.max(width, height);
+            long pixels = (long) width * height;
+            double edgeScale = edge > maximumEdge ? (double) maximumEdge / edge : 1d;
+            double pixelScale = pixels > maximumPixels
+                    ? Math.sqrt((double) maximumPixels / pixels) : 1d;
+            double scale = Math.min(edgeScale, pixelScale);
+            if (scale < 0.999d) {
+                decoder.setTargetSize(Math.max(1, (int) Math.floor(width * scale)),
+                        Math.max(1, (int) Math.floor(height * scale)));
             }
             decoder.setAllocator(ImageDecoder.ALLOCATOR_SOFTWARE);
         });
@@ -678,10 +914,31 @@ public final class MainActivity extends Activity {
         renderCurrent();
     }
 
-    private void translateFolder() {
+    private boolean jumpToPage(int target) {
+        if (images.isEmpty()) return false;
+        int next = Math.max(0, Math.min(target, images.size() - 1));
+        if (currentIndex == next) {
+            imageView.resetMatrix();
+            Toast.makeText(this, next == 0 ? "첫 이미지입니다." : "마지막 이미지입니다.",
+                    Toast.LENGTH_SHORT).show();
+            return true;
+        }
+        currentIndex = next;
+        renderCurrent();
+        return true;
+    }
+
+    private void translateFolder(boolean forceOverwrite) {
         if (batchRunning) return;
         if (allImages.isEmpty() || currentTreeUri == null) {
             Toast.makeText(this, "먼저 이미지 폴더를 선택하세요.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        try {
+            TranslationClient.validateConfiguration(apiSettings, secureStore);
+        } catch (Exception configurationError) {
+            showResult("API 설정 확인 필요", cleanMessage(configurationError), true);
+            Toast.makeText(this, cleanMessage(configurationError), Toast.LENGTH_LONG).show();
             return;
         }
         batchRunning = true;
@@ -700,7 +957,7 @@ public final class MainActivity extends Activity {
         progressBar.setVisibility(View.GONE);
         tokenBadge.setVisibility(View.GONE);
         translateButton.setEnabled(false);
-        translateButton.setText("폴더 번역 중…");
+        translateButton.setText(forceOverwrite ? "전체 재번역 중…" : "폴더 번역 중…");
         translateButton.setAlpha(0.75f);
         modeButton.setEnabled(true);
         modeButton.setAlpha(1f);
@@ -712,7 +969,8 @@ public final class MainActivity extends Activity {
                 ? images.get(currentIndex).uri.toString()
                 : allImages.get(0).uri.toString();
         updateTopProgress(0);
-        executor.execute(() -> runFolderTranslation(snapshot, treeUri, pinnedUri));
+        batchTask = batchExecutor.submit(
+                () -> runFolderTranslation(snapshot, treeUri, pinnedUri, forceOverwrite));
     }
 
     private void requestStopBatch() {
@@ -744,8 +1002,13 @@ public final class MainActivity extends Activity {
 
         while (!batchStopRequested) {
             try {
-                return TranslationClient.translate(getContentResolver(), entry.uri, apiSettings,
-                        secureStore, continuityContext, listener);
+                TranslationClient.TranslationResult result = TranslationClient.translate(
+                        getContentResolver(), entry.uri, apiSettings, secureStore,
+                        continuityContext, listener);
+                if (Thread.currentThread().isInterrupted()) {
+                    throw new TranslationClient.TranslationCancelledException();
+                }
+                return result;
             } catch (TranslationClient.RateLimitException rateLimit) {
                 if (!pauseForRateLimitAndWait(pageNumber, totalPages, rateLimit)) {
                     throw new TranslationClient.TranslationCancelledException();
@@ -762,6 +1025,7 @@ public final class MainActivity extends Activity {
             rateLimitPaused = true;
         }
         runOnUiThread(() -> {
+            if (!isActivityAlive()) return;
             translateButton.setEnabled(true);
             translateButton.setText("계속하기");
             translateButton.setAlpha(1f);
@@ -800,7 +1064,7 @@ public final class MainActivity extends Activity {
 
     private void showRateLimitRetry(int pageNumber, int totalPages, int attempt,
                                     int maxRetries, long remainingSeconds, String message) {
-        if (!batchRunning || batchStopRequested || rateLimitPaused) return;
+        if (!isActivityAlive() || !batchRunning || batchStopRequested || rateLimitPaused) return;
         String clean = message == null ? "" : message.trim();
         if (clean.length() > 80) clean = clean.substring(0, 80) + "…";
         StringBuilder value = new StringBuilder();
@@ -813,7 +1077,8 @@ public final class MainActivity extends Activity {
         tokenBadge.bringToFront();
     }
 
-    private void runFolderTranslation(List<ImageRepository.ImageEntry> snapshot, Uri treeUri, String pinnedUri) {
+    private void runFolderTranslation(List<ImageRepository.ImageEntry> snapshot, Uri treeUri,
+                                      String pinnedUri, boolean forceOverwrite) {
         int successCount = 0;
         int failureCount = 0;
         int cacheCount = 0;
@@ -824,12 +1089,18 @@ public final class MainActivity extends Activity {
         boolean hasUsage = false;
         boolean stopped = false;
         List<String> failures = new ArrayList<>();
-        List<String> warnings = new ArrayList<>();
         try {
+            TranslationClient.validateConfiguration(apiSettings, secureStore);
             Uri outputDir = ImageRepository.ensureSubdirectory(getContentResolver(), treeUri, OUTPUT_DIR_NAME);
+            ImageRepository.verifyWritableDirectory(getContentResolver(), outputDir);
             outputDirectoryUri = outputDir;
             TranslationMemory memory = TranslationMemory.load(getContentResolver(), outputDir);
             translationMemory = memory;
+            TranslationManifest manifest = TranslationManifest.load(getContentResolver(), outputDir);
+            translationManifest = manifest;
+            Map<String, Uri> knownOutputs = ImageRepository.listImageDocumentsByName(
+                    getContentResolver(), outputDir);
+            Map<String, String> outputNames = outputNamesFor(snapshot);
             for (int i = 0; i < snapshot.size(); i++) {
                 if (batchStopRequested) {
                     stopped = true;
@@ -840,6 +1111,7 @@ public final class MainActivity extends Activity {
                 processingImageUri = entry.uri.toString();
                 processingPageNumber = displayIndex + 1;
                 runOnUiThread(() -> {
+                    if (!isActivityAlive()) return;
                     String preferred = currentVisibleUri();
                     if (translatedOnlyMode) {
                         boolean followNewest = images.isEmpty() || currentIndex == images.size() - 1;
@@ -850,10 +1122,18 @@ public final class MainActivity extends Activity {
                     }
                 });
                 try {
-                    String outputName = outputNameFor(entry.name);
-                    Uri existingOutput = ImageRepository.findChildDocumentByName(getContentResolver(), outputDir, outputName);
-                    if (existingOutput != null) {
+                    String outputName = outputNames.get(entry.uri.toString());
+                    Uri existingOutput = knownOutputs.get(outputName);
+                    String fingerprint = outputFingerprint(entry);
+                    if (!forceOverwrite && existingOutput != null
+                            && manifest.isCurrent(entry, outputName, fingerprint)) {
                         translatedOutputMap.put(entry.uri.toString(), existingOutput);
+                        String restoredText = manifest.resultText(entry, fingerprint);
+                        if (!restoredText.isEmpty()) {
+                            translationCache.put(cacheKeyFor(entry),
+                                    new TranslationClient.TranslationResult(
+                                            restoredText, null, null, null));
+                        }
                         skippedCount++;
                         final int fSuccess = successCount;
                         final int fFailure = failureCount;
@@ -864,6 +1144,7 @@ public final class MainActivity extends Activity {
                         final long fTotal = totalTokens;
                         final boolean fUsage = hasUsage;
                         runOnUiThread(() -> {
+                            if (!isActivityAlive()) return;
                             showBatchTokenProgress(displayIndex + 1, snapshot.size(),
                                     fSuccess, fFailure, fCache, fSkipped, fUsage, fInput, fOutput, fTotal);
                             refreshLiveView(currentVisibleUri(), entry.uri.toString());
@@ -871,26 +1152,52 @@ public final class MainActivity extends Activity {
                         continue;
                     }
 
-                    String key = cacheKeyFor(entry);
                     String continuityContext = memory.buildContextPrompt();
-                    TranslationClient.TranslationResult result = translateWithRateLimitRecovery(
-                            entry, continuityContext, displayIndex + 1, snapshot.size());
+                    String key = cacheKeyFor(entry);
+                    TranslationClient.TranslationResult result = forceOverwrite
+                            ? null : translationCache.get(key);
+                    if (result == null || result.blocks.isEmpty()) {
+                        result = translateWithRateLimitRecovery(
+                                entry, continuityContext, displayIndex + 1, snapshot.size());
+                    } else {
+                        cacheCount++;
+                    }
                     translationCache.put(key, result);
 
-                    Bitmap source = decodeForDisplay(entry.uri);
-                    Bitmap composed = TranslatedImageRenderer.compose(source, result.blocks);
-                    if (source != composed && source != null && !source.isRecycled()) source.recycle();
-                    Uri savedUri = ImageRepository.saveBitmap(getContentResolver(), outputDir, outputName, composed);
-                    translatedOutputMap.put(entry.uri.toString(), savedUri);
-                    composed.recycle();
-                    successCount++;
+                    Bitmap source = null;
+                    Bitmap composed = null;
+                    Uri savedUri;
+                    try {
+                        source = decodeForOutput(entry.uri);
+                        composed = TranslatedImageRenderer.compose(source, result.blocks);
+                        try {
+                            savedUri = ImageRepository.saveBitmapKnown(
+                                    getContentResolver(), outputDir, outputName, composed, existingOutput);
+                        } catch (Exception saveError) {
+                            throw new BatchStorageException(
+                                    "번역 이미지 저장 실패: " + entry.name, saveError);
+                        }
+                    } finally {
+                        if (composed != null && composed != source && !composed.isRecycled()) {
+                            composed.recycle();
+                        }
+                        if (source != null && !source.isRecycled()) source.recycle();
+                    }
                     memory.applyResult(entry.name, result);
                     try {
                         memory.save(getContentResolver(), outputDir);
                     } catch (Exception memorySaveError) {
-                        warnings.add(entry.name + "\n• 번역 이미지는 저장됐지만 문맥 파일 저장 실패: "
-                                + cleanMessage(memorySaveError));
+                        throw new BatchStorageException("문맥 파일 저장 실패", memorySaveError);
                     }
+                    try {
+                        manifest.record(entry, outputName, fingerprint, result.text);
+                        manifest.save(getContentResolver(), outputDir);
+                    } catch (Exception manifestSaveError) {
+                        throw new BatchStorageException("번역 manifest 저장 실패", manifestSaveError);
+                    }
+                    knownOutputs.put(outputName, savedUri);
+                    translatedOutputMap.put(entry.uri.toString(), savedUri);
+                    successCount++;
 
                     if (result.usage != null && result.usage.isAvailable()) {
                         if (result.usage.inputTokens >= 0) inputTokens += result.usage.inputTokens;
@@ -908,6 +1215,7 @@ public final class MainActivity extends Activity {
                     final long fTotal = totalTokens;
                     final boolean fUsage = hasUsage;
                     runOnUiThread(() -> {
+                        if (!isActivityAlive()) return;
                         showBatchTokenProgress(displayIndex + 1, snapshot.size(),
                                 fSuccess, fFailure, fCache, fSkipped, fUsage, fInput, fOutput, fTotal);
                         refreshLiveView(currentVisibleUri(), entry.uri.toString());
@@ -915,7 +1223,40 @@ public final class MainActivity extends Activity {
                 } catch (TranslationClient.TranslationCancelledException cancelled) {
                     stopped = true;
                     break;
+                } catch (BatchStorageException storageError) {
+                    throw storageError;
+                } catch (TranslationClient.HttpStatusException httpError) {
+                    if (httpError.statusCode == 400 || httpError.statusCode == 401
+                            || httpError.statusCode == 402 || httpError.statusCode == 403
+                            || httpError.statusCode == 404 || httpError.statusCode == 422) {
+                        throw httpError;
+                    }
+                    failureCount++;
+                    failures.add(entry.name + "\n• " + cleanMessage(httpError));
+                    final int fSuccess = successCount;
+                    final int fFailure = failureCount;
+                    final int fCache = cacheCount;
+                    final int fSkipped = skippedCount;
+                    final long fInput = inputTokens;
+                    final long fOutput = outputTokens;
+                    final long fTotal = totalTokens;
+                    final boolean fUsage = hasUsage;
+                    runOnUiThread(() -> {
+                        if (!isActivityAlive()) return;
+                        showBatchTokenProgress(displayIndex + 1, snapshot.size(),
+                                fSuccess, fFailure, fCache, fSkipped, fUsage,
+                                fInput, fOutput, fTotal);
+                        refreshLiveView(currentVisibleUri(), entry.uri.toString());
+                    });
                 } catch (Exception imageError) {
+                    // Settings can be edited while a 429 pause is active. If credentials or a
+                    // required model were removed, stop here instead of repeating the same
+                    // configuration failure (and image encoding work) for every remaining page.
+                    try {
+                        TranslationClient.validateConfiguration(apiSettings, secureStore);
+                    } catch (Exception configurationError) {
+                        throw configurationError;
+                    }
                     failureCount++;
                     failures.add(entry.name + "\n• " + cleanMessage(imageError));
                     final int fSuccess = successCount;
@@ -927,6 +1268,7 @@ public final class MainActivity extends Activity {
                     final long fTotal = totalTokens;
                     final boolean fUsage = hasUsage;
                     runOnUiThread(() -> {
+                        if (!isActivityAlive()) return;
                         showBatchTokenProgress(displayIndex + 1, snapshot.size(),
                                 fSuccess, fFailure, fCache, fSkipped, fUsage, fInput, fOutput, fTotal);
                         refreshLiveView(currentVisibleUri(), entry.uri.toString());
@@ -934,6 +1276,20 @@ public final class MainActivity extends Activity {
                 }
             }
 
+            Map<String, Uri> currentOutputs = new HashMap<>();
+            Map<String, TranslationClient.TranslationResult> currentResults = new HashMap<>();
+            for (ImageRepository.ImageEntry entry : snapshot) {
+                String outputName = outputNames.get(entry.uri.toString());
+                Uri outputUri = knownOutputs.get(outputName);
+                String fingerprint = outputFingerprint(entry);
+                if (outputUri == null || !manifest.isCurrent(entry, outputName, fingerprint)) continue;
+                currentOutputs.put(entry.uri.toString(), outputUri);
+                String resultText = manifest.resultText(entry, fingerprint);
+                if (!resultText.isEmpty()) {
+                    currentResults.put(cacheKeyFor(entry),
+                            new TranslationClient.TranslationResult(resultText, null, null, null));
+                }
+            }
             final int finalSuccessCount = successCount;
             final int finalFailureCount = failureCount;
             final int finalCacheCount = cacheCount;
@@ -944,7 +1300,12 @@ public final class MainActivity extends Activity {
             final boolean finalHasUsage = hasUsage;
             final boolean finalStopped = stopped;
             runOnUiThread(() -> {
+                if (!isActivityAlive()) return;
                 String visibleBeforeFinish = currentVisibleUri();
+                translatedOutputMap.clear();
+                translatedOutputMap.putAll(currentOutputs);
+                translationCache.clear();
+                translationCache.putAll(currentResults);
                 processingImageUri = null;
                 processingPageNumber = 0;
                 finishBatchUi();
@@ -978,14 +1339,6 @@ public final class MainActivity extends Activity {
                         summary.append("\n\n그 외 ").append(failures.size() - limit).append("건 더 있음");
                     }
                 }
-                if (!warnings.isEmpty()) {
-                    summary.append("\n\n문맥 저장 경고\n");
-                    int limit = Math.min(3, warnings.size());
-                    for (int i = 0; i < limit; i++) {
-                        if (i > 0) summary.append("\n\n");
-                        summary.append(warnings.get(i));
-                    }
-                }
                 showResult(finalStopped ? "폴더 번역 중지됨" : "폴더 번역 완료",
                         summary.toString(), finalFailureCount > 0);
                 showBatchTokenProgress(processedCount, snapshot.size(), finalSuccessCount, finalFailureCount,
@@ -996,14 +1349,35 @@ public final class MainActivity extends Activity {
                         Toast.LENGTH_LONG).show();
             });
         } catch (Exception e) {
+            String errorTitle;
+            String errorMessage;
+            if (e instanceof BatchStorageException) {
+                errorTitle = "저장 오류 · 전체 번역 중단";
+                errorMessage = e.getMessage() + "\n" + cleanMessage(e.getCause());
+            } else if (e instanceof TranslationClient.HttpStatusException
+                    && ((((TranslationClient.HttpStatusException) e).statusCode == 401)
+                    || ((TranslationClient.HttpStatusException) e).statusCode == 403)) {
+                errorTitle = "인증 오류 · 전체 번역 중단";
+                errorMessage = cleanMessage(e);
+            } else {
+                errorTitle = providerLabel() + " 오류";
+                errorMessage = cleanMessage(e);
+            }
             runOnUiThread(() -> {
+                if (!isActivityAlive()) return;
                 processingImageUri = null;
                 processingPageNumber = 0;
                 finishBatchUi();
                 updateTopProgress(0);
-                showResult(providerLabel() + " 오류", cleanMessage(e), true);
+                showResult(errorTitle, errorMessage, true);
                 tokenBadge.setVisibility(View.GONE);
             });
+        }
+    }
+
+    private static final class BatchStorageException extends Exception {
+        BatchStorageException(String message, Throwable cause) {
+            super(message, cause);
         }
     }
 
@@ -1062,7 +1436,29 @@ public final class MainActivity extends Activity {
         translationTitle.setText(title);
         translationTitle.setTextColor(error ? 0xFFFFA3A3 : 0xFFBFD5FF);
         translationText.setText(text);
-        translationPanel.setVisibility(View.VISIBLE);
+        showTranslationPanel();
+    }
+
+    private void showTranslationPanel() {
+        if (translationPanel == null) return;
+        translationPanel.animate().cancel();
+        if (translationPanel.getVisibility() != View.VISIBLE) {
+            translationPanel.setAlpha(0f);
+            translationPanel.setTranslationY(dp(18));
+            translationPanel.setVisibility(View.VISIBLE);
+        }
+        translationPanel.animate().alpha(1f).translationY(0f).setDuration(190L).start();
+    }
+
+    private void hideTranslationPanel() {
+        if (translationPanel == null || translationPanel.getVisibility() != View.VISIBLE) return;
+        translationPanel.animate().cancel();
+        translationPanel.animate().alpha(0f).translationY(dp(18)).setDuration(150L)
+                .withEndAction(() -> {
+                    translationPanel.setVisibility(View.GONE);
+                    translationPanel.setAlpha(1f);
+                    translationPanel.setTranslationY(0f);
+                }).start();
     }
 
     private void copyTranslation() {
@@ -1096,6 +1492,7 @@ public final class MainActivity extends Activity {
         provider.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, providerNames));
         provider.setSelection(ApiSettings.OPENAI.equals(apiSettings.provider()) ? 1
                 : ApiSettings.VERTEX.equals(apiSettings.provider()) ? 2 : 0);
+        provider.setContentDescription("사용할 번역 API 제공자");
         provider.setBackground(roundedBackground(0xFFF1F2F7, 12, 0xFFD5D8E2));
         provider.setPadding(dp(12), 0, dp(8), 0);
         LinearLayout.LayoutParams spinnerParams = new LinearLayout.LayoutParams(
@@ -1109,6 +1506,27 @@ public final class MainActivity extends Activity {
         form.addView(openAiKey, fieldParams());
         form.addView(openAiModel, fieldParams());
         form.addView(openAiEndpoint, fieldParams());
+        form.addView(caption("사용자 지정 엔드포인트에는 API 키 인증 헤더, 이미지, 프롬프트와 폴더 문맥이 전송됩니다. 신뢰하는 HTTPS 호스트만 사용하세요."),
+                matchWrap());
+
+        form.addView(section("OpenAI 서비스 티어"));
+        form.addView(caption("Standard는 지연이 짧은 일반 처리, Flex는 비용을 줄이는 대신 혼잡할 때 대기할 수 있습니다."),
+                matchWrap());
+        Spinner serviceTier = new Spinner(this);
+        String[] serviceTierNames = {
+                "Standard · 빠른 일반 처리",
+                "Flex · 비용 절약 · 대기 가능"
+        };
+        serviceTier.setAdapter(new ArrayAdapter<>(this,
+                android.R.layout.simple_spinner_dropdown_item, serviceTierNames));
+        serviceTier.setSelection(apiSettings.usesFlexTier() ? 1 : 0);
+        serviceTier.setContentDescription("OpenAI 서비스 티어");
+        serviceTier.setBackground(roundedBackground(0xFFF1F2F7, 12, 0xFFD5D8E2));
+        serviceTier.setPadding(dp(12), 0, dp(8), 0);
+        LinearLayout.LayoutParams tierParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(52));
+        tierParams.setMargins(0, dp(4), 0, dp(4));
+        form.addView(serviceTier, tierParams);
 
         form.addView(section("Gemini API"));
         EditText geminiKey = secretField("API 키 · AIza…", secureStore.get("gemini_key"));
@@ -1130,6 +1548,15 @@ public final class MainActivity extends Activity {
                 ? "아직 JSON을 불러오지 않았습니다."
                 : "서비스 계정 JSON이 암호화되어 저장되어 있습니다.");
         form.addView(vertexStatusText, matchWrap());
+
+        form.addView(section("저장된 인증 정보"));
+        form.addView(caption("OpenAI·Gemini API 키와 Vertex 서비스 계정 JSON을 이 기기에서 모두 삭제합니다."),
+                matchWrap());
+        Button deleteCredentials = makeDialogButton("저장된 인증 정보 모두 삭제");
+        deleteCredentials.setContentDescription("저장된 모든 API 인증 정보 삭제");
+        deleteCredentials.setOnClickListener(v ->
+                confirmDeleteAllCredentials(openAiKey, geminiKey));
+        form.addView(deleteCredentials, fieldParams());
 
         form.addView(section("시스템 프롬프트"));
         form.addView(caption("번역 어조, 고유명사 처리, 출력 형식 등을 지정합니다. OpenAI의 instructions와 Gemini·Vertex의 system instruction으로 전송됩니다."), matchWrap());
@@ -1167,17 +1594,37 @@ public final class MainActivity extends Activity {
                 .setNegativeButton("취소", null)
                 .setPositiveButton("저장", null)
                 .create();
+        final String[] confirmedCustomEndpoint = {null};
         dialog.setOnShowListener(ignored -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
             try {
                 String providerValue = provider.getSelectedItemPosition() == 1 ? ApiSettings.OPENAI
                         : provider.getSelectedItemPosition() == 2 ? ApiSettings.VERTEX : ApiSettings.GEMINI;
+                String endpointValue = openAiEndpoint.getText().toString().trim();
+                if (ApiSettings.OPENAI.equals(providerValue)) {
+                    String host = NetworkPolicy.requireHttps(endpointValue).getHost();
+                    if (!NetworkPolicy.isOfficialOpenAiEndpoint(endpointValue)
+                            && !endpointValue.equals(confirmedCustomEndpoint[0])) {
+                        new AlertDialog.Builder(this)
+                                .setTitle("사용자 지정 엔드포인트 확인")
+                                .setMessage(host + " 호스트로 API 키 인증 헤더, 이미지, 프롬프트와 폴더 문맥을 전송합니다. 이 호스트를 신뢰할 때만 계속하세요.")
+                                .setNegativeButton("취소", null)
+                                .setPositiveButton("신뢰하고 저장", (warning, which) -> {
+                                    confirmedCustomEndpoint[0] = endpointValue;
+                                    dialog.getButton(AlertDialog.BUTTON_POSITIVE).performClick();
+                                })
+                                .show();
+                        return;
+                    }
+                }
                 secureStore.put("openai_key", openAiKey.getText().toString().trim());
                 secureStore.put("gemini_key", geminiKey.getText().toString().trim());
                 apiSettings.save(providerValue,
-                        openAiModel.getText().toString(), openAiEndpoint.getText().toString(),
+                        openAiModel.getText().toString(), endpointValue,
                         geminiModel.getText().toString(), vertexModel.getText().toString(),
                         vertexLocation.getText().toString(), vertexProject.getText().toString(),
                         systemPrompt.getText().toString());
+                apiSettings.setServiceTier(serviceTier.getSelectedItemPosition() == 1
+                        ? ApiSettings.SERVICE_TIER_FLEX : ApiSettings.SERVICE_TIER_STANDARD);
                 translationCache.clear();
                 if (batchRunning && rateLimitPaused) {
                     tokenBadge.setText("설정 저장 완료 · 계속하기를 누르면 같은 페이지부터 재시도합니다.");
@@ -1191,6 +1638,14 @@ public final class MainActivity extends Activity {
                     copyButton.setVisibility(View.GONE);
                     stopButton.setVisibility(View.GONE);
                     currentTranslationText = "";
+                    Uri treeToReload = currentTreeUri;
+                    if (treeToReload != null) {
+                        dialog.dismiss();
+                        loadFolder(treeToReload);
+                        Toast.makeText(this, "설정을 저장하고 출력 현재성을 다시 확인합니다.",
+                                Toast.LENGTH_SHORT).show();
+                        return;
+                    }
                     if (currentIndex >= 0) renderCurrent();
                 }
                 Toast.makeText(this, "설정을 저장했습니다.", Toast.LENGTH_SHORT).show();
@@ -1201,6 +1656,28 @@ public final class MainActivity extends Activity {
         }));
         dialog.setOnDismissListener(ignored -> vertexStatusText = null);
         dialog.show();
+    }
+
+    private void confirmDeleteAllCredentials(EditText openAiKey, EditText geminiKey) {
+        new AlertDialog.Builder(this)
+                .setTitle("인증 정보 모두 삭제")
+                .setMessage("저장된 OpenAI·Gemini API 키와 Vertex 서비스 계정 JSON을 모두 삭제할까요?")
+                .setNegativeButton("취소", null)
+                .setPositiveButton("모두 삭제", (dialog, which) -> {
+                    secureStore.clearAll();
+                    TranslationClient.clearCachedCredentials();
+                    translationCache.clear();
+                    openAiKey.setText("");
+                    geminiKey.setText("");
+                    if (vertexStatusText != null) {
+                        vertexStatusText.setText("아직 JSON을 불러오지 않았습니다.");
+                    }
+                    currentTranslationText = "";
+                    copyButton.setVisibility(View.GONE);
+                    Toast.makeText(this, "저장된 인증 정보를 모두 삭제했습니다.",
+                            Toast.LENGTH_LONG).show();
+                })
+                .show();
     }
 
     private void showTranslationMemoryDialog() {
@@ -1262,8 +1739,10 @@ public final class MainActivity extends Activity {
             Toast.makeText(this, "번역이 끝난 뒤 문맥을 초기화하세요.", Toast.LENGTH_SHORT).show();
             return;
         }
+        Uri treeUri = currentTreeUri;
         Uri outputDir = outputDirectoryUri;
-        if (currentTreeUri == null) {
+        int folderVersion = folderLoadVersion.get();
+        if (treeUri == null) {
             Toast.makeText(this, "먼저 이미지 폴더를 선택하세요.", Toast.LENGTH_SHORT).show();
             return;
         }
@@ -1271,26 +1750,38 @@ public final class MainActivity extends Activity {
                 .setTitle("문맥 메모리 초기화")
                 .setMessage("저장된 이름, 고유명사, 높임체, 호칭과 최근 번역 문맥을 모두 지울까요? 번역 이미지 파일은 삭제되지 않습니다.")
                 .setNegativeButton("취소", null)
-                .setPositiveButton("초기화", (dialog, which) -> executor.execute(() -> {
+                .setPositiveButton("초기화", (dialog, which) -> ioExecutor.execute(() -> {
+                    if (!isCurrentFolder(treeUri, folderVersion)) return;
                     try {
                         Uri target = outputDir != null ? outputDir
-                                : ImageRepository.ensureSubdirectory(getContentResolver(), currentTreeUri, OUTPUT_DIR_NAME);
+                                : ImageRepository.ensureSubdirectory(
+                                        getContentResolver(), treeUri, OUTPUT_DIR_NAME);
                         TranslationMemory.reset(getContentResolver(), target);
                         TranslationMemory reset = TranslationMemory.load(getContentResolver(), target);
-                        translationMemory = reset;
-                        outputDirectoryUri = target;
-                        translationCache.clear();
                         runOnUiThread(() -> {
+                            if (!isActivityAlive() || !isCurrentFolder(treeUri, folderVersion)) return;
+                            translationMemory = reset;
+                            outputDirectoryUri = target;
+                            translationCache.clear();
                             statusView.setText("인물 0 · 용어 0 · 호칭 0\n최근 번역 문맥 없음");
                             updateTopProgress(processingPageNumber);
                             Toast.makeText(this, "문맥 메모리를 초기화했습니다.", Toast.LENGTH_SHORT).show();
                         });
                     } catch (Exception e) {
-                        runOnUiThread(() -> Toast.makeText(this,
-                                "초기화 오류: " + cleanMessage(e), Toast.LENGTH_LONG).show());
+                        runOnUiThread(() -> {
+                            if (isActivityAlive() && isCurrentFolder(treeUri, folderVersion)) {
+                                Toast.makeText(this, "초기화 오류: " + cleanMessage(e),
+                                        Toast.LENGTH_LONG).show();
+                            }
+                        });
                     }
                 }))
                 .show();
+    }
+
+    private boolean isCurrentFolder(Uri treeUri, int version) {
+        return treeUri != null && treeUri.equals(currentTreeUri)
+                && version == folderLoadVersion.get();
     }
 
     private String activeModel() {
@@ -1300,14 +1791,28 @@ public final class MainActivity extends Activity {
     }
 
     private String providerLabel() {
-        if (ApiSettings.OPENAI.equals(apiSettings.provider())) return "OpenAI";
+        if (ApiSettings.OPENAI.equals(apiSettings.provider())) {
+            return "OpenAI · " + (apiSettings.usesFlexTier() ? "Flex" : "Standard");
+        }
         if (ApiSettings.VERTEX.equals(apiSettings.provider())) return "Vertex AI";
         return "Gemini";
     }
 
     private String cacheKeyFor(ImageRepository.ImageEntry entry) {
-        return entry.uri + "|" + apiSettings.provider() + "|" + activeModel()
-                + "|" + apiSettings.openAiEndpoint() + "|" + apiSettings.systemPrompt().hashCode();
+        return outputFingerprint(entry);
+    }
+
+    private String outputFingerprint(ImageRepository.ImageEntry entry) {
+        String provider = apiSettings.provider();
+        String endpoint = ApiSettings.OPENAI.equals(provider) ? apiSettings.openAiEndpoint() : "";
+        String serviceTier = ApiSettings.OPENAI.equals(provider) ? apiSettings.serviceTier() : "";
+        String project = ApiSettings.VERTEX.equals(provider) ? apiSettings.vertexProject() : "";
+        String location = ApiSettings.VERTEX.equals(provider) ? apiSettings.vertexLocation() : "";
+        String prompt = apiSettings.systemPrompt();
+        if (prompt == null || prompt.trim().isEmpty()) prompt = TranslationClient.defaultSystemPrompt();
+        return OutputFingerprint.create(entry.uri.toString(), entry.name, entry.size,
+                entry.lastModified, provider, activeModel(), endpoint, serviceTier,
+                project, location, prompt, "");
     }
 
     private String readUtf8(Uri uri, int maxCharacters) throws Exception {
@@ -1327,25 +1832,94 @@ public final class MainActivity extends Activity {
     private void swapDisplayedBitmap(Bitmap bitmap) {
         Bitmap old = currentBitmap;
         currentBitmap = bitmap;
+        imageView.animate().cancel();
+        imageView.setAlpha(bitmap == null ? 1f : 0.28f);
         imageView.setImageBitmap(bitmap);
+        if (bitmap != null) {
+            imageView.animate().alpha(1f).setDuration(170L).start();
+        }
         if (old != null && old != bitmap && !old.isRecycled()) old.recycle();
     }
 
-    private String outputNameFor(String inputName) {
-        int dot = inputName.lastIndexOf('.');
-        String base = dot > 0 ? inputName.substring(0, dot) : inputName;
-        return base + "_translated.png";
+    private Map<String, String> outputNamesFor(List<ImageRepository.ImageEntry> entries) {
+        Map<String, Integer> baseCounts = new HashMap<>();
+        for (ImageRepository.ImageEntry entry : entries) {
+            String base = outputBaseName(entry.name).toLowerCase(Locale.ROOT);
+            baseCounts.put(base, baseCounts.getOrDefault(base, 0) + 1);
+        }
+        Map<String, String> result = new HashMap<>();
+        for (ImageRepository.ImageEntry entry : entries) {
+            String sourceName = entry.name == null || entry.name.trim().isEmpty()
+                    ? "image" : entry.name.trim();
+            String base = outputBaseName(sourceName);
+            boolean collides = baseCounts.getOrDefault(base.toLowerCase(Locale.ROOT), 0) > 1;
+            result.put(entry.uri.toString(), collides
+                    ? sourceName + ".translated.png" : base + "_translated.png");
+        }
+        return result;
+    }
+
+    private String outputBaseName(String inputName) {
+        String sourceName = inputName == null || inputName.trim().isEmpty()
+                ? "image" : inputName.trim();
+        int dot = sourceName.lastIndexOf('.');
+        return dot > 0 ? sourceName.substring(0, dot) : sourceName;
+    }
+
+    @SuppressWarnings("deprecation")
+    private void applySystemBarInsets(WindowInsets insets,
+                                      FrameLayout.LayoutParams imageParams,
+                                      FrameLayout.LayoutParams topParams,
+                                      FrameLayout.LayoutParams bottomParams,
+                                      FrameLayout.LayoutParams panelParams,
+                                      FrameLayout.LayoutParams tokenParams,
+                                      FrameLayout.LayoutParams copyParams,
+                                      FrameLayout.LayoutParams stopParams) {
+        int left = Math.max(0, insets.getSystemWindowInsetLeft());
+        int top = Math.max(0, insets.getSystemWindowInsetTop());
+        int right = Math.max(0, insets.getSystemWindowInsetRight());
+        int bottom = Math.max(0, insets.getSystemWindowInsetBottom());
+        DisplayCutout cutout = insets.getDisplayCutout();
+        if (cutout != null) {
+            left = Math.max(left, cutout.getSafeInsetLeft());
+            top = Math.max(top, cutout.getSafeInsetTop());
+            right = Math.max(right, cutout.getSafeInsetRight());
+            bottom = Math.max(bottom, cutout.getSafeInsetBottom());
+        }
+
+        imageParams.topMargin = dp(126) + top;
+        imageParams.bottomMargin = dp(84) + bottom;
+        int availableHeight = Math.max(1,
+                getResources().getDisplayMetrics().heightPixels - top - bottom);
+        panelParams.height = calculatePanelHeight(availableHeight);
+        topParams.setMargins(dp(12) + left, dp(8) + top, dp(12) + right, 0);
+        bottomParams.setMargins(dp(12) + left, 0, dp(12) + right, dp(10) + bottom);
+        panelParams.setMargins(dp(8) + left, 0, dp(8) + right, dp(82) + bottom);
+        tokenParams.setMargins(0, 0, dp(20) + right, dp(94) + bottom);
+        copyParams.setMargins(dp(20) + left, 0, 0, dp(94) + bottom);
+        stopParams.setMargins(dp(20) + left, 0, 0, dp(94) + bottom);
+    }
+
+    private int calculatePanelHeight(int availableHeight) {
+        boolean landscape = getResources().getConfiguration().orientation
+                == Configuration.ORIENTATION_LANDSCAPE;
+        int minimum = landscape ? dp(112) : dp(180);
+        int desired = Math.round(availableHeight * (landscape ? 0.54f : 0.48f));
+        int viewportCap = Math.max(dp(96), availableHeight - dp(126));
+        return Math.min(viewportCap, Math.max(minimum, Math.min(dp(340), desired)));
     }
 
     private Button makeToolbarButton(String text) {
         Button button = baseButton(text, 13f, COLOR_TEXT);
-        button.setBackground(roundedBackground(COLOR_SURFACE_2, 14, COLOR_STROKE));
+        button.setBackground(rippleRoundedBackground(COLOR_SURFACE_2, 14, COLOR_STROKE,
+                0x28FFFFFF));
         return button;
     }
 
     private Button makeNavButton(String text) {
         Button button = baseButton(text, 13f, COLOR_TEXT);
-        button.setBackground(roundedBackground(COLOR_SURFACE_2, 16, COLOR_STROKE));
+        button.setBackground(rippleRoundedBackground(COLOR_SURFACE_2, 16, COLOR_STROKE,
+                0x28FFFFFF));
         return button;
     }
 
@@ -1356,13 +1930,14 @@ public final class MainActivity extends Activity {
                 GradientDrawable.Orientation.LEFT_RIGHT,
                 new int[]{COLOR_PRIMARY, COLOR_PRIMARY_2});
         background.setCornerRadius(dp(16));
-        button.setBackground(background);
+        button.setBackground(new RippleDrawable(ColorStateList.valueOf(0x35FFFFFF), background, null));
         return button;
     }
 
     private Button makePanelButton(String text) {
         Button button = baseButton(text, 12f, COLOR_TEXT);
-        button.setBackground(roundedBackground(COLOR_SURFACE_2, 13, COLOR_STROKE));
+        button.setBackground(rippleRoundedBackground(COLOR_SURFACE_2, 13, COLOR_STROKE,
+                0x28FFFFFF));
         return button;
     }
 
@@ -1371,18 +1946,21 @@ public final class MainActivity extends Activity {
         button.setText(text);
         button.setTextColor(textColor);
         button.setTextSize(textSize);
+        button.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        button.setLetterSpacing(0.01f);
         button.setAllCaps(false);
         button.setGravity(Gravity.CENTER);
         button.setPadding(dp(5), 0, dp(5), 0);
-        button.setMinHeight(0);
-        button.setMinWidth(0);
+        button.setMinHeight(dp(48));
+        button.setMinWidth(dp(48));
         button.setStateListAnimator(null);
         return button;
     }
 
     private Button makeDialogButton(String text) {
         Button button = baseButton(text, 14f, 0xFF2E3150);
-        button.setBackground(roundedBackground(0xFFE9E7FF, 12, 0xFFC9C4F5));
+        button.setBackground(rippleRoundedBackground(0xFFE9E7FF, 12, 0xFFC9C4F5,
+                0x247867FF));
         return button;
     }
 
@@ -1393,6 +1971,7 @@ public final class MainActivity extends Activity {
         view.setTypeface(Typeface.DEFAULT_BOLD);
         view.setTextColor(0xFF262936);
         view.setPadding(0, dp(20), 0, dp(7));
+        view.setAccessibilityHeading(true);
         return view;
     }
 
@@ -1411,6 +1990,7 @@ public final class MainActivity extends Activity {
         field.setHint(hint);
         field.setHintTextColor(0xFF8D92A0);
         field.setTextColor(0xFF252833);
+        field.setContentDescription(hint);
         field.setText(value == null ? "" : value);
         field.setSingleLine(false);
         field.setTextSize(14f);
@@ -1446,6 +2026,13 @@ public final class MainActivity extends Activity {
         return drawable;
     }
 
+    private RippleDrawable rippleRoundedBackground(int color, int radiusDp, int strokeColor,
+                                                    int rippleColor) {
+        GradientDrawable content = roundedBackground(color, radiusDp, strokeColor);
+        GradientDrawable mask = roundedBackground(Color.WHITE, radiusDp, 0);
+        return new RippleDrawable(ColorStateList.valueOf(rippleColor), content, mask);
+    }
+
     private GradientDrawable roundedTopBackground(int color, int radiusDp, int strokeColor) {
         GradientDrawable drawable = new GradientDrawable();
         drawable.setColor(color);
@@ -1467,10 +2054,46 @@ public final class MainActivity extends Activity {
         return message;
     }
 
+    private void handleBackPressed() {
+        if (translationPanel != null && translationPanel.getVisibility() == View.VISIBLE) {
+            hideTranslationPanel();
+            return;
+        }
+        if (batchRunning) {
+            new AlertDialog.Builder(this)
+                    .setTitle("번역이 진행 중입니다")
+                    .setMessage("현재 작업을 중지할까요? 완료된 이미지는 그대로 저장됩니다.")
+                    .setNegativeButton("계속 번역", null)
+                    .setPositiveButton("중지", (dialog, which) -> requestStopBatch())
+                    .show();
+            return;
+        }
+        backPressedCallback.setEnabled(false);
+        getOnBackPressedDispatcher().onBackPressed();
+    }
+
     @Override protected void onDestroy() {
+        folderLoadVersion.incrementAndGet();
         imageLoadVersion.incrementAndGet();
-        executor.shutdownNow();
+        batchStopRequested = true;
+        synchronized (rateLimitPauseLock) {
+            rateLimitPaused = false;
+            rateLimitPauseLock.notifyAll();
+        }
+        cancelImageLoadTask();
+        Future<?> runningBatch = batchTask;
+        batchTask = null;
+        if (runningBatch != null && !runningBatch.isDone()) runningBatch.cancel(true);
+        displayExecutor.shutdownNow();
+        batchExecutor.shutdownNow();
+        ioExecutor.shutdownNow();
+        if (imageView != null) imageView.setImageDrawable(null);
         if (currentBitmap != null && !currentBitmap.isRecycled()) currentBitmap.recycle();
+        currentBitmap = null;
         super.onDestroy();
+    }
+
+    private boolean isActivityAlive() {
+        return !isFinishing() && !isDestroyed();
     }
 }

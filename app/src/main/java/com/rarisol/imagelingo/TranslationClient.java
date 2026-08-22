@@ -29,9 +29,8 @@ import java.security.spec.PKCS8EncodedKeySpec;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 public final class TranslationClient {
     private static final String DEFAULT_SYSTEM_PROMPT =
@@ -53,16 +52,61 @@ public final class TranslationClient {
     private static final String USER_REQUEST =
             "이미지 속 외국어를 한국어로 번역하고 원문 좌표와 필요한 문맥 업데이트를 지정된 JSON 형식으로 반환하세요.";
 
+    // Balanced for OCR readability while reducing encode + upload time versus the 0.x defaults.
+    private static final int MAX_IMAGE_EDGE = 1440;
+    private static final int JPEG_QUALITY = 80;
+    private static final int MAX_OUTPUT_TOKENS = 8192;
+    private static final int MAX_RESPONSE_CHARACTERS = 2_000_000;
+    private static final int MAX_TRANSLATION_BLOCKS = 200;
+    private static final int MAX_BLOCK_TEXT_CHARACTERS = 2_000;
     private static final int MAX_RATE_LIMIT_RETRIES = 5;
     private static final long[] RATE_LIMIT_BACKOFF_MS = {5_000L, 10_000L, 20_000L, 40_000L, 60_000L};
-    private static final Pattern RETRY_DELAY_PATTERN = Pattern.compile(
-            "(?:retryDelay|retry_delay)[^0-9]{0,40}([0-9]+(?:\\.[0-9]+)?)s",
-            Pattern.CASE_INSENSITIVE);
 
     private static final Map<String, CachedToken> TOKEN_CACHE = new HashMap<>();
 
     public static String defaultSystemPrompt() {
         return DEFAULT_SYSTEM_PROMPT;
+    }
+
+    public static synchronized void clearCachedCredentials() {
+        TOKEN_CACHE.clear();
+    }
+
+    public static void validateConfiguration(ApiSettings settings, SecureStore secrets) throws Exception {
+        if (settings == null || secrets == null) {
+            throw new IllegalArgumentException("API 설정을 불러오지 못했습니다.");
+        }
+        switch (settings.provider()) {
+            case ApiSettings.OPENAI:
+                require(secrets.get("openai_key"), "OpenAI API 키가 설정되지 않았습니다.");
+                require(settings.openAiModel(), "OpenAI 모델명이 비어 있습니다.");
+                NetworkPolicy.requireHttps(settings.openAiEndpoint());
+                break;
+            case ApiSettings.VERTEX:
+                require(settings.vertexModel(), "Vertex AI 모델명이 비어 있습니다.");
+                String jsonText = secrets.get("vertex_json");
+                require(jsonText, "Vertex AI 서비스 계정 JSON을 불러오지 않았습니다.");
+                JSONObject service = new JSONObject(jsonText);
+                require(service.optString("client_email"), "Vertex client_email이 없습니다.");
+                require(service.optString("private_key"), "Vertex private_key가 없습니다.");
+                parsePrivateKey(service.getString("private_key"));
+                NetworkPolicy.requireGoogleTokenEndpoint(service.optString(
+                        "token_uri", "https://oauth2.googleapis.com/token"));
+                String project = settings.vertexProject().trim();
+                if (project.isEmpty()) project = service.optString("project_id", "");
+                require(project, "Vertex AI 프로젝트 ID가 없습니다.");
+                String location = settings.vertexLocation().trim().isEmpty()
+                        ? "global" : settings.vertexLocation().trim();
+                if (!location.matches("[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")) {
+                    throw new IllegalArgumentException("Vertex AI 리전 형식이 올바르지 않습니다.");
+                }
+                break;
+            case ApiSettings.GEMINI:
+            default:
+                require(secrets.get("gemini_key"), "Gemini API 키가 설정되지 않았습니다.");
+                require(settings.geminiModel(), "Gemini 모델명이 비어 있습니다.");
+                break;
+        }
     }
 
     public static TranslationResult translate(ContentResolver resolver, Uri imageUri,
@@ -79,9 +123,11 @@ public final class TranslationClient {
     public static TranslationResult translate(ContentResolver resolver, Uri imageUri,
                                               ApiSettings settings, SecureStore secrets,
                                               String continuityContext, RetryListener retryListener) throws Exception {
+        validateConfiguration(settings, secrets);
         ImagePayload image = encodeImage(resolver, imageUri);
-        String systemPrompt = settings.systemPrompt().trim().isEmpty()
-                ? DEFAULT_SYSTEM_PROMPT : settings.systemPrompt().trim();
+        String configuredPrompt = settings.systemPrompt();
+        configuredPrompt = configuredPrompt == null ? "" : configuredPrompt.trim();
+        String systemPrompt = configuredPrompt.isEmpty() ? DEFAULT_SYSTEM_PROMPT : configuredPrompt;
         StringBuilder structuredPrompt = new StringBuilder(systemPrompt)
                 .append("\n\n").append(STRUCTURED_OUTPUT_INSTRUCTION);
         if (continuityContext != null && !continuityContext.trim().isEmpty()) {
@@ -107,11 +153,19 @@ public final class TranslationClient {
         require(apiKey, "OpenAI API 키가 설정되지 않았습니다.");
         require(settings.openAiModel(), "OpenAI 모델명이 비어 있습니다.");
         require(settings.openAiEndpoint(), "OpenAI 엔드포인트가 비어 있습니다.");
+        NetworkPolicy.requireHttps(settings.openAiEndpoint());
 
         JSONObject body = new JSONObject();
         body.put("model", settings.openAiModel());
         body.put("instructions", systemPrompt);
-        body.put("max_output_tokens", 2500);
+        body.put("max_output_tokens", MAX_OUTPUT_TOKENS);
+        body.put("store", false);
+        body.put("text", new JSONObject().put("format", openAiTranslationFormat()));
+        if (settings.usesFlexTier()) {
+            body.put("service_tier", "flex");
+        } else if (NetworkPolicy.isOfficialOpenAiEndpoint(settings.openAiEndpoint())) {
+            body.put("service_tier", "default");
+        }
 
         JSONArray input = new JSONArray();
         JSONObject message = new JSONObject();
@@ -130,10 +184,68 @@ public final class TranslationClient {
         headers.put("Authorization", "Bearer " + apiKey.trim());
         JSONObject response = postJson(settings.openAiEndpoint(), body, headers, retryListener);
 
+        String status = response.optString("status", "completed");
+        if (!status.isEmpty() && !"completed".equalsIgnoreCase(status)) {
+            JSONObject details = response.optJSONObject("incomplete_details");
+            String reason = details == null ? status : details.optString("reason", status);
+            throw new IllegalStateException("OpenAI 응답이 완료되지 않았습니다: " + reason);
+        }
+
         String rawText = parseOpenAiText(response);
         TokenUsage usage = parseOpenAiUsage(response);
         ParsedTranslation parsed = parseStructuredTranslation(rawText);
         return new TranslationResult(parsed.text, usage, parsed.blocks, parsed.memoryUpdates);
+    }
+
+    private static JSONObject openAiTranslationFormat() throws Exception {
+        return new JSONObject()
+                .put("type", "json_schema")
+                .put("name", "imagelingo_translation")
+                .put("strict", false)
+                .put("schema", translationJsonSchema());
+    }
+
+    private static JSONObject translationJsonSchema() throws Exception {
+        JSONObject coordinate = new JSONObject()
+                .put("type", "number")
+                .put("minimum", 0)
+                .put("maximum", 1000);
+        JSONObject dimension = new JSONObject()
+                .put("type", "number")
+                .put("exclusiveMinimum", 0)
+                .put("maximum", 1000);
+        JSONObject block = new JSONObject()
+                .put("type", "object")
+                .put("properties", new JSONObject()
+                        .put("text", new JSONObject().put("type", "string")
+                                .put("maxLength", MAX_BLOCK_TEXT_CHARACTERS))
+                        .put("x", coordinate)
+                        .put("y", coordinate)
+                        .put("width", dimension)
+                        .put("height", dimension))
+                .put("required", new JSONArray()
+                        .put("text").put("x").put("y").put("width").put("height"))
+                .put("additionalProperties", false);
+        JSONObject memoryMap = new JSONObject()
+                .put("type", "object")
+                .put("additionalProperties", true);
+        JSONObject memory = new JSONObject()
+                .put("type", "object")
+                .put("properties", new JSONObject()
+                        .put("characters", memoryMap)
+                        .put("terms", new JSONObject(memoryMap.toString()))
+                        .put("honorifics", new JSONObject(memoryMap.toString())))
+                .put("additionalProperties", false);
+        return new JSONObject()
+                .put("type", "object")
+                .put("properties", new JSONObject()
+                        .put("blocks", new JSONObject()
+                                .put("type", "array")
+                                .put("maxItems", MAX_TRANSLATION_BLOCKS)
+                                .put("items", block))
+                        .put("memory_updates", memory))
+                .put("required", new JSONArray().put("blocks").put("memory_updates"))
+                .put("additionalProperties", false);
     }
 
     private static String parseOpenAiText(JSONObject response) {
@@ -183,7 +295,7 @@ public final class TranslationClient {
         require(settings.geminiModel(), "Gemini 모델명이 비어 있습니다.");
         String model = settings.geminiModel().replace("models/", "");
         String endpoint = "https://generativelanguage.googleapis.com/v1beta/models/"
-                + model + ":generateContent";
+                + urlPath(model) + ":generateContent";
 
         JSONObject inline = new JSONObject()
                 .put("mime_type", image.mimeType)
@@ -193,13 +305,21 @@ public final class TranslationClient {
                 .put(new JSONObject().put("inline_data", inline));
         JSONObject systemInstruction = new JSONObject()
                 .put("parts", new JSONArray().put(new JSONObject().put("text", systemPrompt)));
+        JSONObject generationConfig = new JSONObject()
+                .put("maxOutputTokens", MAX_OUTPUT_TOKENS);
+        if (model.startsWith("gemini-3")) {
+            generationConfig.put("responseFormat", new JSONObject()
+                    .put("text", new JSONObject()
+                            .put("mimeType", "application/json")
+                            .put("schema", translationJsonSchema())));
+        } else {
+            generationConfig.put("responseMimeType", "application/json")
+                    .put("responseJsonSchema", translationJsonSchema());
+        }
         JSONObject body = new JSONObject()
                 .put("system_instruction", systemInstruction)
                 .put("contents", new JSONArray().put(new JSONObject().put("role", "user").put("parts", parts)))
-                .put("generationConfig", new JSONObject()
-                        .put("temperature", 0.1)
-                        .put("maxOutputTokens", 2500)
-                        .put("responseMimeType", "application/json"));
+                .put("generationConfig", generationConfig);
         Map<String, String> headers = new HashMap<>();
         headers.put("x-goog-api-key", apiKey.trim());
         JSONObject response = postJson(endpoint, body, headers, retryListener);
@@ -215,10 +335,14 @@ public final class TranslationClient {
         String clientEmail = service.getString("client_email");
         String privateKey = service.getString("private_key");
         String tokenUri = service.optString("token_uri", "https://oauth2.googleapis.com/token");
+        NetworkPolicy.requireGoogleTokenEndpoint(tokenUri);
         String project = settings.vertexProject().trim();
         if (project.isEmpty()) project = service.optString("project_id", "");
         require(project, "Vertex AI 프로젝트 ID가 없습니다.");
         String location = settings.vertexLocation().trim().isEmpty() ? "global" : settings.vertexLocation().trim();
+        if (!location.matches("[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")) {
+            throw new IllegalArgumentException("Vertex AI 리전 형식이 올바르지 않습니다.");
+        }
         String token = getAccessToken(clientEmail, privateKey, tokenUri);
         String host = "global".equalsIgnoreCase(location)
                 ? "aiplatform.googleapis.com"
@@ -239,12 +363,23 @@ public final class TranslationClient {
                 .put("systemInstruction", systemInstruction)
                 .put("contents", new JSONArray().put(new JSONObject().put("role", "user").put("parts", parts)))
                 .put("generationConfig", new JSONObject()
-                        .put("temperature", 0.1)
-                        .put("maxOutputTokens", 2500)
-                        .put("responseMimeType", "application/json"));
+                        .put("maxOutputTokens", MAX_OUTPUT_TOKENS)
+                        .put("responseMimeType", "application/json")
+                        .put("responseJsonSchema", translationJsonSchema()));
         Map<String, String> headers = new HashMap<>();
         headers.put("Authorization", "Bearer " + token);
-        JSONObject response = postJson(endpoint, body, headers, retryListener);
+        JSONObject response;
+        try {
+            response = postJson(endpoint, body, headers, retryListener);
+        } catch (HttpStatusException authError) {
+            if (authError.statusCode != 401) throw authError;
+            synchronized (TranslationClient.class) {
+                TOKEN_CACHE.remove(clientEmail);
+            }
+            headers.put("Authorization", "Bearer "
+                    + getAccessToken(clientEmail, privateKey, tokenUri));
+            response = postJson(endpoint, body, headers, retryListener);
+        }
         return parseGeminiResult(response, "Vertex AI");
     }
 
@@ -253,8 +388,12 @@ public final class TranslationClient {
         if (candidates == null || candidates.length() == 0) {
             throw new IllegalStateException(provider + " 응답에 번역 후보가 없습니다.");
         }
-        JSONObject content = candidates.optJSONObject(0) == null
-                ? null : candidates.optJSONObject(0).optJSONObject("content");
+        JSONObject candidate = candidates.optJSONObject(0);
+        String finishReason = candidate == null ? "" : candidate.optString("finishReason", "");
+        if (!finishReason.isEmpty() && !"STOP".equalsIgnoreCase(finishReason)) {
+            throw new IllegalStateException(provider + " 응답이 완료되지 않았습니다: " + finishReason);
+        }
+        JSONObject content = candidate == null ? null : candidate.optJSONObject("content");
         JSONArray parts = content == null ? null : content.optJSONArray("parts");
         StringBuilder result = new StringBuilder();
         if (parts != null) {
@@ -285,68 +424,44 @@ public final class TranslationClient {
     }
 
     private static ParsedTranslation parseStructuredTranslation(String rawText) {
-        String clean = stripCodeFence(rawText == null ? "" : rawText.trim());
+        String clean = rawText == null ? "" : rawText.trim();
+        if (clean.isEmpty()) {
+            throw new IllegalStateException("API 응답에 번역 JSON이 없습니다.");
+        }
+        if (clean.length() > MAX_RESPONSE_CHARACTERS) {
+            throw new IllegalStateException("API 번역 응답이 허용 크기를 초과했습니다.");
+        }
         List<TranslationBlock> blocks = new ArrayList<>();
-        List<String> unplacedTexts = new ArrayList<>();
         JSONObject memoryUpdates = new JSONObject();
-        JSONObject rootObject = null;
         try {
-            JSONArray values;
-            if (clean.startsWith("[")) {
-                values = new JSONArray(clean);
-            } else {
-                int start = clean.indexOf('{');
-                int end = clean.lastIndexOf('}');
-                if (start < 0 || end <= start) throw new IllegalArgumentException("JSON 객체 없음");
-                rootObject = new JSONObject(clean.substring(start, end + 1));
-                JSONObject updates = rootObject.optJSONObject("memory_updates");
-                if (updates != null) memoryUpdates = updates;
-                values = rootObject.optJSONArray("blocks");
-                if (values == null) values = rootObject.optJSONArray("translations");
-                if (values == null) values = new JSONArray();
+            if (!clean.startsWith("{") || !clean.endsWith("}")) {
+                throw new IllegalArgumentException("JSON 객체 없음");
+            }
+            JSONObject rootObject = new JSONObject(clean);
+            JSONObject updates = rootObject.optJSONObject("memory_updates");
+            if (updates != null) memoryUpdates = updates;
+            JSONArray values = rootObject.optJSONArray("blocks");
+            if (values == null) throw new IllegalArgumentException("blocks 배열 없음");
+            if (values.length() > MAX_TRANSLATION_BLOCKS) {
+                throw new IllegalArgumentException("번역 블록이 너무 많습니다.");
             }
             for (int i = 0; i < values.length(); i++) {
                 JSONObject item = values.optJSONObject(i);
-                if (item == null) continue;
-                String text = firstNonEmpty(item.optString("text", ""),
-                        item.optString("translation", ""), item.optString("translated_text", "")).trim();
-                if (text.isEmpty()) continue;
+                if (item == null) throw new IllegalArgumentException("번역 블록이 객체가 아닙니다.");
+                String text = item.optString("text", "").trim();
+                if (text.isEmpty()) throw new IllegalArgumentException("번역 블록 text가 비어 있습니다.");
+                if (text.length() > MAX_BLOCK_TEXT_CHARACTERS) {
+                    throw new IllegalArgumentException("번역 블록 텍스트가 너무 깁니다.");
+                }
 
                 double x = item.optDouble("x", Double.NaN);
                 double y = item.optDouble("y", Double.NaN);
                 double width = item.optDouble("width", Double.NaN);
                 double height = item.optDouble("height", Double.NaN);
-                JSONObject boxObject = item.optJSONObject("box");
-                if (boxObject != null) {
-                    x = boxObject.optDouble("x", x);
-                    y = boxObject.optDouble("y", y);
-                    width = boxObject.optDouble("width", width);
-                    height = boxObject.optDouble("height", height);
-                }
-                JSONArray boxArray = item.optJSONArray("box");
-                if (boxArray != null && boxArray.length() >= 4) {
-                    x = boxArray.optDouble(0, x);
-                    y = boxArray.optDouble(1, y);
-                    width = boxArray.optDouble(2, width);
-                    height = boxArray.optDouble(3, height);
-                }
-                if ((!isFinitePositive(width) || !isFinitePositive(height)
-                        || Double.isNaN(x) || Double.isNaN(y))) {
-                    double x1 = item.optDouble("x1", Double.NaN);
-                    double y1 = item.optDouble("y1", Double.NaN);
-                    double x2 = item.optDouble("x2", Double.NaN);
-                    double y2 = item.optDouble("y2", Double.NaN);
-                    if (!Double.isNaN(x1) && !Double.isNaN(y1)
-                            && !Double.isNaN(x2) && !Double.isNaN(y2)
-                            && x2 > x1 && y2 > y1) {
-                        x = x1;
-                        y = y1;
-                        width = x2 - x1;
-                        height = y2 - y1;
-                    } else {
-                        unplacedTexts.add(text);
-                        continue;
-                    }
+                if (!isFinitePositive(width) || !isFinitePositive(height)
+                        || Double.isNaN(x) || Double.isInfinite(x)
+                        || Double.isNaN(y) || Double.isInfinite(y)) {
+                    throw new IllegalArgumentException("번역 블록 좌표가 없거나 잘못되었습니다.");
                 }
 
                 double maxValue = Math.max(Math.max(Math.abs(x), Math.abs(y)),
@@ -363,31 +478,9 @@ public final class TranslationClient {
                 float safeHeight = clamp((float) height, 1f, 1000f - safeY);
                 blocks.add(new TranslationBlock(text, safeX, safeY, safeWidth, safeHeight));
             }
-        } catch (Exception ignored) {
-            // Compatible endpoints may ignore JSON-only instructions. Fallback below keeps the translation usable.
-        }
-
-        if (!unplacedTexts.isEmpty()) {
-            int count = unplacedTexts.size();
-            float height = Math.min(220f, Math.max(90f, 760f / Math.max(1, count)));
-            float startY = Math.max(40f, 500f - (count * height) * 0.5f);
-            for (int i = 0; i < count; i++) {
-                float y = clamp(startY + i * height, 20f, 900f);
-                blocks.add(new TranslationBlock(unplacedTexts.get(i), 80f, y, 840f,
-                        Math.min(height - 12f, 1000f - y)));
-            }
-        }
-
-        if (blocks.isEmpty() && !clean.isEmpty()
-                && !clean.equals("{\"blocks\":[]}") && !clean.equals("[]")) {
-            String fallbackText = clean;
-            try {
-                JSONObject root = rootObject != null ? rootObject : new JSONObject(clean);
-                if (root.optJSONArray("blocks") != null) fallbackText = "";
-            } catch (Exception ignored) {}
-            if (!fallbackText.isEmpty()) {
-                blocks.add(new TranslationBlock(fallbackText, 80f, 690f, 840f, 240f));
-            }
+        } catch (Exception malformed) {
+            throw new IllegalStateException("구조화된 번역 JSON을 해석하지 못했습니다: "
+                    + malformed.getMessage(), malformed);
         }
 
         StringBuilder combined = new StringBuilder();
@@ -397,24 +490,6 @@ public final class TranslationClient {
         }
         String text = combined.length() == 0 ? "[번역할 텍스트 없음]" : combined.toString();
         return new ParsedTranslation(text, blocks, memoryUpdates);
-    }
-
-    private static String stripCodeFence(String value) {
-        String clean = value.trim();
-        if (clean.startsWith("```")) {
-            int firstNewline = clean.indexOf('\n');
-            if (firstNewline >= 0) clean = clean.substring(firstNewline + 1);
-            int closing = clean.lastIndexOf("```");
-            if (closing >= 0) clean = clean.substring(0, closing);
-        }
-        return clean.trim();
-    }
-
-    private static String firstNonEmpty(String... values) {
-        for (String value : values) {
-            if (value != null && !value.trim().isEmpty()) return value;
-        }
-        return "";
     }
 
     private static boolean isFinitePositive(double value) {
@@ -482,27 +557,33 @@ public final class TranslationClient {
         Bitmap decoded = ImageDecoder.decodeBitmap(source, (decoder, info, src) -> {
             Size size = info.getSize();
             int max = Math.max(size.getWidth(), size.getHeight());
-            if (max > 1600) {
-                float ratio = 1600f / max;
+            if (max > MAX_IMAGE_EDGE) {
+                float ratio = (float) MAX_IMAGE_EDGE / max;
                 decoder.setTargetSize(Math.max(1, Math.round(size.getWidth() * ratio)),
                         Math.max(1, Math.round(size.getHeight() * ratio)));
             }
             decoder.setAllocator(ImageDecoder.ALLOCATOR_SOFTWARE);
         });
         Bitmap rgb = decoded;
-        if (decoded.hasAlpha()) {
-            rgb = Bitmap.createBitmap(decoded.getWidth(), decoded.getHeight(), Bitmap.Config.ARGB_8888);
-            Canvas canvas = new Canvas(rgb);
-            canvas.drawColor(Color.WHITE);
-            canvas.drawBitmap(decoded, 0, 0, null);
+        try {
+            if (decoded.hasAlpha()) {
+                rgb = Bitmap.createBitmap(decoded.getWidth(), decoded.getHeight(), Bitmap.Config.ARGB_8888);
+                Canvas canvas = new Canvas(rgb);
+                canvas.drawColor(Color.WHITE);
+                canvas.drawBitmap(decoded, 0, 0, null);
+            }
+            int initialCapacity = Math.min(1_500_000,
+                    Math.max(64 * 1024, (rgb.getWidth() * rgb.getHeight()) / 3));
+            ByteArrayOutputStream output = new ByteArrayOutputStream(initialCapacity);
+            if (!rgb.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, output)) {
+                throw new IllegalStateException("이미지를 JPEG로 변환하지 못했습니다.");
+            }
+            return new ImagePayload("image/jpeg",
+                    Base64.encodeToString(output.toByteArray(), Base64.NO_WRAP));
+        } finally {
+            if (rgb != null && rgb != decoded && !rgb.isRecycled()) rgb.recycle();
+            if (decoded != null && !decoded.isRecycled()) decoded.recycle();
         }
-        ByteArrayOutputStream output = new ByteArrayOutputStream();
-        if (!rgb.compress(Bitmap.CompressFormat.JPEG, 82, output)) {
-            throw new IllegalStateException("이미지를 JPEG로 변환하지 못했습니다.");
-        }
-        if (rgb != decoded) rgb.recycle();
-        decoded.recycle();
-        return new ImagePayload("image/jpeg", Base64.encodeToString(output.toByteArray(), Base64.NO_WRAP));
     }
 
     private static JSONObject postJson(String endpoint, JSONObject body,
@@ -517,39 +598,53 @@ public final class TranslationClient {
     }
 
     private static JSONObject request(String endpoint, String contentType, byte[] body,
-                                      Map<String, String> headers, RetryListener retryListener,
-                                      boolean retryRateLimit) throws Exception {
+                                       Map<String, String> headers, RetryListener retryListener,
+                                       boolean retryRateLimit) throws Exception {
+        URL url = NetworkPolicy.requireHttps(endpoint);
         int retryAttempt = 0;
         while (true) {
             if (retryListener != null && retryListener.isCancelled()) {
                 throw new TranslationCancelledException();
             }
-            HttpURLConnection connection = (HttpURLConnection) new URL(endpoint).openConnection();
-            connection.setRequestMethod("POST");
-            connection.setConnectTimeout(25_000);
-            connection.setReadTimeout(90_000);
-            connection.setDoOutput(true);
-            connection.setRequestProperty("Content-Type", contentType);
-            connection.setRequestProperty("Accept", "application/json");
-            connection.setRequestProperty("User-Agent", "ImageLingo/0.9 Android");
-            for (Map.Entry<String, String> entry : headers.entrySet()) {
-                connection.setRequestProperty(entry.getKey(), entry.getValue());
+            HttpURLConnection connection = null;
+            int code;
+            String retryAfterHeader;
+            String responseText;
+            try {
+                connection = (HttpURLConnection) url.openConnection();
+                connection.setInstanceFollowRedirects(false);
+                connection.setRequestMethod("POST");
+                connection.setConnectTimeout(25_000);
+                connection.setReadTimeout(90_000);
+                connection.setDoOutput(true);
+                connection.setUseCaches(false);
+                connection.setRequestProperty("Content-Type", contentType);
+                connection.setRequestProperty("Accept", "application/json");
+                connection.setRequestProperty("User-Agent", "ImageLingo/1.0 Android");
+                for (Map.Entry<String, String> entry : headers.entrySet()) {
+                    connection.setRequestProperty(entry.getKey(), entry.getValue());
+                }
+                connection.setFixedLengthStreamingMode(body.length);
+                try (OutputStream output = connection.getOutputStream()) {
+                    output.write(body);
+                }
+                code = connection.getResponseCode();
+                retryAfterHeader = connection.getHeaderField("Retry-After");
+                long contentLength = connection.getContentLengthLong();
+                if (contentLength > MAX_RESPONSE_CHARACTERS * 4L) {
+                    throw new IOException("API 응답이 허용 크기를 초과했습니다.");
+                }
+                InputStream stream = code >= 200 && code < 300
+                        ? connection.getInputStream() : connection.getErrorStream();
+                responseText = readAll(stream, MAX_RESPONSE_CHARACTERS);
+            } finally {
+                if (connection != null) connection.disconnect();
             }
-            connection.setFixedLengthStreamingMode(body.length);
-            try (OutputStream output = connection.getOutputStream()) {
-                output.write(body);
-            }
-            int code = connection.getResponseCode();
-            String retryAfterHeader = connection.getHeaderField("Retry-After");
-            InputStream stream = code >= 200 && code < 300
-                    ? connection.getInputStream() : connection.getErrorStream();
-            String responseText = readAll(stream);
-            connection.disconnect();
 
             if (code >= 200 && code < 300) return new JSONObject(responseText);
             String errorMessage = extractError(responseText);
             if (code != 429 || !retryRateLimit) {
-                throw new IllegalStateException("HTTP " + code + ": " + errorMessage);
+                throw new HttpStatusException(code, errorMessage);
             }
             if (isNonRecoverableQuotaError(errorMessage + " " + responseText)) {
                 throw new RateLimitException(errorMessage, retryAttempt);
@@ -559,8 +654,9 @@ public final class TranslationClient {
             }
 
             long backoff = RATE_LIMIT_BACKOFF_MS[Math.min(retryAttempt, RATE_LIMIT_BACKOFF_MS.length - 1)];
-            long retryAfter = Math.max(parseRetryAfterMillis(retryAfterHeader),
-                    parseRetryDelayFromBody(responseText));
+            long retryAfter = Math.max(
+                    RetryPolicy.parseRetryAfterMillis(retryAfterHeader, System.currentTimeMillis()),
+                    RetryPolicy.parseRetryDelayFromBody(responseText));
             long delayMs = Math.max(backoff, retryAfter);
             retryAttempt++;
             waitForRetry(delayMs, retryAttempt, retryListener, errorMessage);
@@ -569,7 +665,9 @@ public final class TranslationClient {
 
     private static void waitForRetry(long delayMs, int attempt, RetryListener listener,
                                      String message) throws Exception {
-        long remaining = Math.max(1_000L, Math.min(delayMs, 120_000L));
+        // Honor server Retry-After guidance while retaining a finite ceiling. The UI remains
+        // cancellable once per second during a long provider-requested pause.
+        long remaining = Math.max(1_000L, Math.min(delayMs, 15L * 60L * 1000L));
         while (remaining > 0L) {
             if (listener != null && listener.isCancelled()) throw new TranslationCancelledException();
             long seconds = Math.max(1L, (remaining + 999L) / 1000L);
@@ -588,7 +686,7 @@ public final class TranslationClient {
 
     private static boolean isNonRecoverableQuotaError(String message) {
         if (message == null) return false;
-        String lower = message.toLowerCase();
+        String lower = message.toLowerCase(Locale.ROOT);
         return lower.contains("insufficient_quota")
                 || lower.contains("check your plan")
                 || lower.contains("billing details")
@@ -596,34 +694,18 @@ public final class TranslationClient {
                 || lower.contains("payment required");
     }
 
-    private static long parseRetryAfterMillis(String value) {
-        if (value == null || value.trim().isEmpty()) return 0L;
-        try {
-            double seconds = Double.parseDouble(value.trim());
-            return Math.max(0L, Math.round(seconds * 1000d));
-        } catch (Exception ignored) {
-            return 0L;
-        }
-    }
-
-    private static long parseRetryDelayFromBody(String body) {
-        if (body == null || body.isEmpty()) return 0L;
-        Matcher matcher = RETRY_DELAY_PATTERN.matcher(body);
-        if (!matcher.find()) return 0L;
-        try {
-            double seconds = Double.parseDouble(matcher.group(1));
-            return Math.max(0L, Math.round(seconds * 1000d));
-        } catch (Exception ignored) {
-            return 0L;
-        }
-    }
-
-    private static String readAll(InputStream stream) throws Exception {
+    private static String readAll(InputStream stream, int maxCharacters) throws Exception {
         if (stream == null) return "";
         StringBuilder result = new StringBuilder();
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))) {
-            String line;
-            while ((line = reader.readLine()) != null) result.append(line).append('\n');
+            char[] buffer = new char[4096];
+            int read;
+            while ((read = reader.read(buffer)) >= 0) {
+                result.append(buffer, 0, read);
+                if (result.length() > maxCharacters) {
+                    throw new IOException("API 응답이 허용 크기를 초과했습니다.");
+                }
+            }
         }
         return result.toString();
     }
@@ -667,6 +749,15 @@ public final class TranslationClient {
             super(message == null || message.trim().isEmpty()
                     ? "API 사용량 제한(429)에 도달했습니다." : message);
             this.retryCount = retryCount;
+        }
+    }
+
+    public static final class HttpStatusException extends IOException {
+        public final int statusCode;
+        HttpStatusException(int statusCode, String message) {
+            super("HTTP " + statusCode + ": "
+                    + (message == null || message.trim().isEmpty() ? "요청 실패" : message));
+            this.statusCode = statusCode;
         }
     }
 
