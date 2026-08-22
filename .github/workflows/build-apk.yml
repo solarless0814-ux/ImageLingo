@@ -15,7 +15,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  JAVA_VERSION: '17'
+  # AGP 9.3.1 lint currently calls Java 21 collection APIs on Linux.
+  JAVA_VERSION: '21'
   ANDROID_PLATFORM: 'platforms;android-36'
   ANDROID_BUILD_TOOLS: 'build-tools;36.0.0'
 

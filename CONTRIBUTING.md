@@ -2,7 +2,7 @@
 
 ## Local setup
 
-1. Install JDK 17 or newer, Android SDK Platform 36, and Build Tools 36.0.0.
+1. Install JDK 21, Android SDK Platform 36, and Build Tools 36.0.0. The app source/target level remains Java 17.
 2. Clone the repository. Do not add `local.properties`, keystores, API keys, or
    service-account JSON files to Git.
 3. Point `ANDROID_HOME` (or `sdk.dir` in your untracked `local.properties`) to

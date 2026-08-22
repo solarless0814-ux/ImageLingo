@@ -21,7 +21,7 @@
 ### 변경
 
 - 기본 모델을 OpenAI `gpt-5.6-luna`, Gemini API/Vertex AI `gemini-3.7-flash`로 갱신
-- Android Gradle Plugin 9.3.1, Gradle 9.7.1, Android API 36, Build-Tools 36.0.0, JDK 17+ 빌드 체인으로 갱신
+- Android Gradle Plugin 9.3.1, Gradle 9.7.1, Android API 36, Build-Tools 36.0.0, JDK 21 빌드 체인으로 갱신(Java source/target 17 유지)
 - `compileSdk`/`targetSdk`를 36으로, `versionName`을 `1.0.0`, `versionCode`를 `10000`으로 갱신
 - 다른 폴더를 선택할 때 이전 폴더의 지속 SAF 권한을 해제하고 현재 폴더 권한만 유지하도록 변경
 - 앱 백업과 평문 네트워크를 비활성화하고, 사용자 지정 OpenAI 엔드포인트를 HTTPS로 제한
@@ -51,7 +51,7 @@
 
 - 릴리스 상태를 `1.0.0 준비 중`과 기준일 2026-08-22로 명확히 표시
 - 로컬 검증 명령을 `lintDebug testDebugUnitTest assembleDebug assembleRelease`로 갱신
-- AGP 9.3.1/Gradle 9.7.1/API 36/Build-Tools 36.0.0/JDK 17+ 요구 사항 추가
+- AGP 9.3.1/Gradle 9.7.1/API 36/Build-Tools 36.0.0/JDK 21 요구 사항 추가
 - JKS 생성 명령에 `-storetype JKS`를 명시하고 Secret, 태그, 서명, `apksigner`, SHA-256 절차 정리
 - 아직 존재하지 않는 버전 태그와 GitHub Release 링크 제거
 

@@ -102,7 +102,7 @@ ImageLingo 자체에는 API 구독이나 결제 대행이 포함되어 있지 �
 
 - Android Gradle Plugin 9.3.1
 - Gradle Wrapper 9.7.1
-- JDK 17 이상(AGP 최소 17, CI는 Temurin 17, Java source/target 17)
+- JDK 21(CI는 Temurin 21, 앱 Java source/target은 17)
 - Android SDK Platform 36 (`compileSdk`/`targetSdk` 36)
 - Android SDK Build-Tools 36.0.0
 - 최소 지원 기기: Android 9(API 28)
@@ -157,7 +157,7 @@ adb install -r ./app/build/outputs/apk/debug/app-debug.apk
 검증 작업은 다음을 수행합니다.
 
 1. Gradle Wrapper 무결성 확인
-2. JDK 17과 Android API 36/Build-Tools 36.0.0 설치
+2. JDK 21과 Android API 36/Build-Tools 36.0.0 설치
 3. `lintDebug`, `testDebugUnitTest`, 디버그/unsigned 릴리스 APK 빌드
 4. APK SHA-256 생성
 5. 14일 보관 CI 아티팩트 업로드
