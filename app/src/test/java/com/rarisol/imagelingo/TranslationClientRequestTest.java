@@ -64,6 +64,69 @@ public final class TranslationClientRequestTest {
         assertTrue(error.getMessage().contains("global, us 또는 eu"));
     }
 
+    @Test public void vertexArgonUsesResponseFormatAndRoomForThinking() throws Exception {
+        JSONObject config = TranslationClient.buildVertexGenerationConfig("gemini-4-argon");
+
+        assertTrue(config.has("responseFormat"));
+        assertFalse(config.has("responseMimeType"));
+        assertEquals(32_768, config.getInt("maxOutputTokens"));
+        assertEquals(8192, TranslationClient.buildVertexGenerationConfig("gemini-3.7-flash")
+                .getInt("maxOutputTokens"));
+        assertTrue(TranslationClient.readTimeoutFor("publishers/google/models/gemini-4-argon")
+                > TranslationClient.readTimeoutFor("gemini-3.7-flash"));
+    }
+
+    @Test public void argonSendsChosenThinkingLevelOnBothApis() throws Exception {
+        assertEquals("high", TranslationClient.buildVertexGenerationConfig("gemini-4-argon", "high")
+                .getJSONObject("thinkingConfig").getString("thinkingLevel"));
+        assertEquals("low", TranslationClient.buildGeminiGenerationConfig("models/gemini-4-argon", "LOW")
+                .getJSONObject("thinkingConfig").getString("thinkingLevel"));
+        assertEquals("medium", TranslationClient.buildVertexGenerationConfig("gemini-4-argon", "bogus")
+                .getJSONObject("thinkingConfig").getString("thinkingLevel"));
+    }
+
+    @Test public void flash38SendsThinkingLevelWithHeadroom() throws Exception {
+        JSONObject vertex = TranslationClient.buildVertexGenerationConfig("gemini-3.8-flash", "high");
+        assertEquals("high", vertex.getJSONObject("thinkingConfig").getString("thinkingLevel"));
+        assertEquals(32_768, vertex.getInt("maxOutputTokens"));
+        assertTrue(vertex.has("responseFormat"));
+        assertEquals("low", TranslationClient.buildGeminiGenerationConfig("models/gemini-3.8-flash", "low")
+                .getJSONObject("thinkingConfig").getString("thinkingLevel"));
+        assertTrue(TranslationClient.readTimeoutFor("gemini-3.8-flash")
+                > TranslationClient.readTimeoutFor("gemini-3.7-flash"));
+    }
+
+    @Test public void olderModelsNeverGetThinkingConfig() throws Exception {
+        assertFalse(TranslationClient.buildVertexGenerationConfig("gemini-3.7-flash", "high")
+                .has("thinkingConfig"));
+        assertFalse(TranslationClient.buildGeminiGenerationConfig("gemini-2.5-flash", "low")
+                .has("thinkingConfig"));
+        assertFalse(TranslationClient.buildVertexGenerationConfig("gemini-4-argon")
+                .has("thinkingConfig"));
+    }
+
+    @Test public void rejectsUnsupportedArgonRegionBeforeUploading() {
+        TranslationClient.validateVertexModelLocation("gemini-4-argon", "global");
+        TranslationClient.validateVertexModelLocation("gemini-4-argon", "eu");
+
+        IllegalArgumentException error = assertThrows(IllegalArgumentException.class,
+                () -> TranslationClient.validateVertexModelLocation(
+                        "gemini-4-argon", "asia-northeast3"));
+        assertTrue(error.getMessage().contains("global, us 또는 eu"));
+    }
+
+    @Test public void vertex403HintNamesProjectMismatchAndArgonAccess() {
+        String hint = TranslationClient.vertexPermissionHint(
+                "HTTP 403: Permission denied", "typed-project", "json-project",
+                "bot@json-project.iam.gserviceaccount.com", "gemini-4-argon", "global");
+
+        assertTrue(hint.startsWith("Permission denied"));
+        assertTrue(hint.contains("typed-project"));
+        assertTrue(hint.contains("json-project"));
+        assertTrue(hint.contains("roles/aiplatform.user"));
+        assertTrue(hint.contains("Argon"));
+    }
+
     @Test public void includesGoogleFieldViolationsInHttpError() {
         String body = "{\"error\":{\"message\":\"Request contains an invalid argument.\","
                 + "\"details\":[{\"fieldViolations\":[{\"field\":\"generationConfig.responseFormat\","
