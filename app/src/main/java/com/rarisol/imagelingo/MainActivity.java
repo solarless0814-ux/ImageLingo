@@ -1549,6 +1549,32 @@ public final class MainActivity extends ComponentActivity {
                 : "서비스 계정 JSON이 암호화되어 저장되어 있습니다.");
         form.addView(vertexStatusText, matchWrap());
 
+        form.addView(section("추론 단계 · Gemini 4 Argon"));
+        form.addView(caption("Gemini API와 Vertex AI에서 gemini-4 모델을 쓸 때만 적용됩니다. 높을수록 정확도가 오를 수 있지만 느려지고 토큰 비용이 늘어납니다."),
+                matchWrap());
+        Spinner thinkingLevel = new Spinner(this);
+        String[] thinkingLevelValues = {
+                ApiSettings.THINKING_LOW, ApiSettings.THINKING_MEDIUM, ApiSettings.THINKING_HIGH
+        };
+        String[] thinkingLevelNames = {
+                "Low · 빠르고 저렴",
+                "Medium · 기본값",
+                "High · 깊게 추론 · 느림"
+        };
+        thinkingLevel.setAdapter(new ArrayAdapter<>(this,
+                android.R.layout.simple_spinner_dropdown_item, thinkingLevelNames));
+        String savedThinkingLevel = apiSettings.thinkingLevel();
+        for (int i = 0; i < thinkingLevelValues.length; i++) {
+            if (thinkingLevelValues[i].equals(savedThinkingLevel)) thinkingLevel.setSelection(i);
+        }
+        thinkingLevel.setContentDescription("Gemini 4 추론 단계");
+        thinkingLevel.setBackground(roundedBackground(0xFFF1F2F7, 12, 0xFFD5D8E2));
+        thinkingLevel.setPadding(dp(12), 0, dp(8), 0);
+        LinearLayout.LayoutParams thinkingParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(52));
+        thinkingParams.setMargins(0, dp(4), 0, dp(4));
+        form.addView(thinkingLevel, thinkingParams);
+
         form.addView(section("저장된 인증 정보"));
         form.addView(caption("OpenAI·Gemini API 키와 Vertex 서비스 계정 JSON을 이 기기에서 모두 삭제합니다."),
                 matchWrap());
@@ -1625,6 +1651,9 @@ public final class MainActivity extends ComponentActivity {
                         systemPrompt.getText().toString());
                 apiSettings.setServiceTier(serviceTier.getSelectedItemPosition() == 1
                         ? ApiSettings.SERVICE_TIER_FLEX : ApiSettings.SERVICE_TIER_STANDARD);
+                int thinkingIndex = thinkingLevel.getSelectedItemPosition();
+                apiSettings.setThinkingLevel(thinkingIndex >= 0 && thinkingIndex < thinkingLevelValues.length
+                        ? thinkingLevelValues[thinkingIndex] : ApiSettings.THINKING_MEDIUM);
                 translationCache.clear();
                 if (batchRunning && rateLimitPaused) {
                     tokenBadge.setText("설정 저장 완료 · 계속하기를 누르면 같은 페이지부터 재시도합니다.");
@@ -1794,8 +1823,10 @@ public final class MainActivity extends ComponentActivity {
         if (ApiSettings.OPENAI.equals(apiSettings.provider())) {
             return "OpenAI · " + (apiSettings.usesFlexTier() ? "Flex" : "Standard");
         }
-        if (ApiSettings.VERTEX.equals(apiSettings.provider())) return "Vertex AI";
-        return "Gemini";
+        String thinking = TranslationClient.supportsThinkingLevel(activeModel())
+                ? " · 추론 " + apiSettings.thinkingLevel() : "";
+        if (ApiSettings.VERTEX.equals(apiSettings.provider())) return "Vertex AI" + thinking;
+        return "Gemini" + thinking;
     }
 
     private String cacheKeyFor(ImageRepository.ImageEntry entry) {
@@ -1806,6 +1837,10 @@ public final class MainActivity extends ComponentActivity {
         String provider = apiSettings.provider();
         String endpoint = ApiSettings.OPENAI.equals(provider) ? apiSettings.openAiEndpoint() : "";
         String serviceTier = ApiSettings.OPENAI.equals(provider) ? apiSettings.serviceTier() : "";
+        // Only Gemini 4 requests carry a thinking level, so other models keep their old fingerprints.
+        if (!ApiSettings.OPENAI.equals(provider) && TranslationClient.supportsThinkingLevel(activeModel())) {
+            serviceTier = "thinking:" + apiSettings.thinkingLevel();
+        }
         String project = ApiSettings.VERTEX.equals(provider) ? apiSettings.vertexProject() : "";
         String location = ApiSettings.VERTEX.equals(provider) ? apiSettings.vertexLocation() : "";
         String prompt = apiSettings.systemPrompt();

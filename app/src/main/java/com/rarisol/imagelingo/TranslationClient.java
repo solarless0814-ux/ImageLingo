@@ -56,6 +56,14 @@ public final class TranslationClient {
     private static final int MAX_IMAGE_EDGE = 1440;
     private static final int JPEG_QUALITY = 80;
     private static final int MAX_OUTPUT_TOKENS = 8192;
+    /**
+     * Gemini 4 Argon always thinks, and thinking tokens count against maxOutputTokens.
+     * 32,768 is the non-streaming REST ceiling; a smaller cap can end in an empty answer.
+     */
+    private static final int ARGON_MAX_OUTPUT_TOKENS = 32_768;
+    private static final int DEFAULT_READ_TIMEOUT_MS = 90_000;
+    /** Argon can reason for several minutes on a dense page. */
+    private static final int ARGON_READ_TIMEOUT_MS = 10 * 60 * 1000;
     private static final int MAX_RESPONSE_CHARACTERS = 2_000_000;
     private static final int MAX_TRANSLATION_BLOCKS = 200;
     private static final int MAX_BLOCK_TEXT_CHARACTERS = 2_000;
@@ -258,9 +266,48 @@ public final class TranslationClient {
                 .put("additionalProperties", false);
     }
 
+    static boolean isArgonModel(String model) {
+        return normalizeModelId(model).startsWith("gemini-4-argon");
+    }
+
+    /** Gemini 3 and later use the responseFormat structured-output shape. */
+    static boolean usesResponseFormat(String model) {
+        String id = normalizeModelId(model);
+        return id.startsWith("gemini-3") || id.startsWith("gemini-4");
+    }
+
+    static int maxOutputTokensFor(String model) {
+        return isArgonModel(model) ? ARGON_MAX_OUTPUT_TOKENS : MAX_OUTPUT_TOKENS;
+    }
+
+    static int readTimeoutFor(String model) {
+        return isArgonModel(model) ? ARGON_READ_TIMEOUT_MS : DEFAULT_READ_TIMEOUT_MS;
+    }
+
+    /** Only Gemini 4 models take the low/medium/high thinking level from settings. */
+    static boolean supportsThinkingLevel(String model) {
+        return normalizeModelId(model).startsWith("gemini-4");
+    }
+
+    private static void putThinkingLevel(JSONObject config, String model, String thinkingLevel)
+            throws Exception {
+        if (thinkingLevel == null || !supportsThinkingLevel(model)) return;
+        config.put("thinkingConfig", new JSONObject()
+                .put("thinkingLevel", ApiSettings.normalizeThinkingLevel(thinkingLevel)));
+    }
+
     static JSONObject buildGeminiGenerationConfig(String model) throws Exception {
-        JSONObject config = new JSONObject().put("maxOutputTokens", MAX_OUTPUT_TOKENS);
-        if (normalizeModelId(model).startsWith("gemini-3")) {
+        return buildGeminiGenerationConfig(model, null);
+    }
+
+    static JSONObject buildVertexGenerationConfig(String model) throws Exception {
+        return buildVertexGenerationConfig(model, null);
+    }
+
+    static JSONObject buildGeminiGenerationConfig(String model, String thinkingLevel) throws Exception {
+        JSONObject config = new JSONObject().put("maxOutputTokens", maxOutputTokensFor(model));
+        putThinkingLevel(config, model, thinkingLevel);
+        if (usesResponseFormat(model)) {
             // The Gemini Developer API uses one responseFormat object and an IANA MIME string.
             config.put("responseFormat", new JSONObject()
                     .put("text", new JSONObject()
@@ -273,9 +320,10 @@ public final class TranslationClient {
         return config;
     }
 
-    static JSONObject buildVertexGenerationConfig(String model) throws Exception {
-        JSONObject config = new JSONObject().put("maxOutputTokens", MAX_OUTPUT_TOKENS);
-        if (normalizeModelId(model).startsWith("gemini-3")) {
+    static JSONObject buildVertexGenerationConfig(String model, String thinkingLevel) throws Exception {
+        JSONObject config = new JSONObject().put("maxOutputTokens", maxOutputTokensFor(model));
+        putThinkingLevel(config, model, thinkingLevel);
+        if (usesResponseFormat(model)) {
             // Vertex AI v1 differs from the Developer API: responseFormat is an array and
             // TextResponseFormat.mimeType is the APPLICATION_JSON enum value.
             config.put("responseFormat", new JSONArray().put(new JSONObject()
@@ -313,12 +361,13 @@ public final class TranslationClient {
     static void validateVertexModelLocation(String modelValue, String locationValue) {
         String model = normalizeModelId(modelValue);
         String location = normalizeVertexLocation(locationValue);
-        if (model.startsWith("gemini-3.7-flash")
+        boolean multiRegionOnly = model.startsWith("gemini-3.7-flash") || isArgonModel(model);
+        if (multiRegionOnly
                 && !"global".equals(location)
                 && !"us".equals(location)
                 && !"eu".equals(location)) {
             throw new IllegalArgumentException(
-                    "gemini-3.7-flash의 Vertex AI 리전은 global, us 또는 eu만 지원합니다. global을 권장합니다.");
+                    model + "의 Vertex AI 리전은 global, us 또는 eu만 지원합니다. global을 권장합니다.");
         }
     }
 
@@ -379,14 +428,14 @@ public final class TranslationClient {
                 .put(new JSONObject().put("inline_data", inline));
         JSONObject systemInstruction = new JSONObject()
                 .put("parts", new JSONArray().put(new JSONObject().put("text", systemPrompt)));
-        JSONObject generationConfig = buildGeminiGenerationConfig(model);
+        JSONObject generationConfig = buildGeminiGenerationConfig(model, settings.thinkingLevel());
         JSONObject body = new JSONObject()
                 .put("system_instruction", systemInstruction)
                 .put("contents", new JSONArray().put(new JSONObject().put("role", "user").put("parts", parts)))
                 .put("generationConfig", generationConfig);
         Map<String, String> headers = new HashMap<>();
         headers.put("x-goog-api-key", apiKey.trim());
-        JSONObject response = postJson(endpoint, body, headers, retryListener);
+        JSONObject response = postJson(endpoint, body, headers, retryListener, readTimeoutFor(model));
         return parseGeminiResult(response, "Gemini");
     }
 
@@ -426,20 +475,28 @@ public final class TranslationClient {
         JSONObject body = new JSONObject()
                 .put("systemInstruction", systemInstruction)
                 .put("contents", new JSONArray().put(new JSONObject().put("role", "user").put("parts", parts)))
-                .put("generationConfig", buildVertexGenerationConfig(model));
+                .put("generationConfig", buildVertexGenerationConfig(model, settings.thinkingLevel()));
         Map<String, String> headers = new HashMap<>();
         headers.put("Authorization", "Bearer " + token);
+        int readTimeoutMs = readTimeoutFor(model);
         JSONObject response;
         try {
-            response = postJson(endpoint, body, headers, retryListener);
-        } catch (HttpStatusException authError) {
-            if (authError.statusCode != 401) throw authError;
-            synchronized (TranslationClient.class) {
-                TOKEN_CACHE.remove(clientEmail);
+            try {
+                response = postJson(endpoint, body, headers, retryListener, readTimeoutMs);
+            } catch (HttpStatusException authError) {
+                if (authError.statusCode != 401) throw authError;
+                synchronized (TranslationClient.class) {
+                    TOKEN_CACHE.remove(clientEmail);
+                }
+                headers.put("Authorization", "Bearer "
+                        + getAccessToken(clientEmail, privateKey, tokenUri));
+                response = postJson(endpoint, body, headers, retryListener, readTimeoutMs);
             }
-            headers.put("Authorization", "Bearer "
-                    + getAccessToken(clientEmail, privateKey, tokenUri));
-            response = postJson(endpoint, body, headers, retryListener);
+        } catch (HttpStatusException forbidden) {
+            if (forbidden.statusCode != 403) throw forbidden;
+            throw new HttpStatusException(403, vertexPermissionHint(
+                    forbidden.getMessage(), project, service.optString("project_id", ""),
+                    clientEmail, model, location));
         }
         return parseGeminiResult(response, "Vertex AI");
     }
@@ -647,20 +704,57 @@ public final class TranslationClient {
         }
     }
 
+    /**
+     * Turns Google's bare 403 into a checklist naming the exact project, account and model,
+     * so the user can see which side (IAM, API, model access, project mismatch) to fix.
+     */
+    static String vertexPermissionHint(String original, String project, String jsonProject,
+                                       String clientEmail, String model, String location) {
+        String detail = original == null ? "" : original.replaceFirst("^HTTP 403:\\s*", "").trim();
+        StringBuilder hint = new StringBuilder(detail.isEmpty() ? "권한 거부(403)" : detail);
+        hint.append("\n\n요청: 프로젝트 ").append(project)
+                .append(" · 리전 ").append(location)
+                .append(" · 모델 ").append(model)
+                .append("\n서비스 계정: ").append(clientEmail)
+                .append("\n\n확인할 것:");
+        int step = 1;
+        if (jsonProject != null && !jsonProject.isEmpty() && !jsonProject.equals(project)) {
+            hint.append("\n").append(step++).append(". 설정의 프로젝트 ID(").append(project)
+                    .append(")가 JSON의 project_id(").append(jsonProject)
+                    .append(")와 다릅니다. 다른 프로젝트를 쓰려면 그 프로젝트에도 이 서비스 계정 권한을 주세요.");
+        }
+        hint.append("\n").append(step++).append(". 프로젝트에서 Vertex AI API(aiplatform.googleapis.com)가 사용 설정되어 있는지");
+        hint.append("\n").append(step++).append(". IAM에서 이 서비스 계정에 'Vertex AI 사용자'(roles/aiplatform.user) 역할이 있는지");
+        hint.append("\n").append(step++).append(". 프로젝트에 결제 계정이 연결되어 있는지");
+        if (isArgonModel(model)) {
+            hint.append("\n").append(step).append(". Gemini 4 Argon은 단계적으로 공개 중인 모델입니다. "
+                    + "Model Garden에서 이 프로젝트가 Argon을 쓸 수 있는지(사용 설정·약관 동의) 확인하세요. "
+                    + "같은 계정으로 gemini-3.7-flash가 되면 Argon 접근 권한 문제입니다.");
+        }
+        return hint.toString();
+    }
+
     private static JSONObject postJson(String endpoint, JSONObject body,
                                        Map<String, String> headers, RetryListener retryListener) throws Exception {
+        return postJson(endpoint, body, headers, retryListener, DEFAULT_READ_TIMEOUT_MS);
+    }
+
+    private static JSONObject postJson(String endpoint, JSONObject body, Map<String, String> headers,
+                                       RetryListener retryListener, int readTimeoutMs) throws Exception {
         return request(endpoint, "application/json; charset=utf-8",
-                body.toString().getBytes(StandardCharsets.UTF_8), headers, retryListener, true);
+                body.toString().getBytes(StandardCharsets.UTF_8), headers, retryListener, true,
+                readTimeoutMs);
     }
 
     private static JSONObject postForm(String endpoint, String body) throws Exception {
         return request(endpoint, "application/x-www-form-urlencoded; charset=utf-8",
-                body.getBytes(StandardCharsets.UTF_8), new HashMap<>(), null, false);
+                body.getBytes(StandardCharsets.UTF_8), new HashMap<>(), null, false,
+                DEFAULT_READ_TIMEOUT_MS);
     }
 
     private static JSONObject request(String endpoint, String contentType, byte[] body,
                                        Map<String, String> headers, RetryListener retryListener,
-                                       boolean retryRateLimit) throws Exception {
+                                       boolean retryRateLimit, int readTimeoutMs) throws Exception {
         URL url = NetworkPolicy.requireHttps(endpoint);
         int retryAttempt = 0;
         while (true) {
@@ -676,7 +770,7 @@ public final class TranslationClient {
                 connection.setInstanceFollowRedirects(false);
                 connection.setRequestMethod("POST");
                 connection.setConnectTimeout(25_000);
-                connection.setReadTimeout(90_000);
+                connection.setReadTimeout(readTimeoutMs);
                 connection.setDoOutput(true);
                 connection.setUseCaches(false);
                 connection.setRequestProperty("Content-Type", contentType);

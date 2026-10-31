@@ -13,6 +13,11 @@ public final class ApiSettings {
     /** OpenAI Flex processing. It can be cheaper, but may wait when capacity is busy. */
     public static final String SERVICE_TIER_FLEX = "FLEX";
 
+    /** Gemini 4 thinking levels, sent as generationConfig.thinkingConfig.thinkingLevel. */
+    public static final String THINKING_LOW = "low";
+    public static final String THINKING_MEDIUM = "medium";
+    public static final String THINKING_HIGH = "high";
+
     private static final String PREFS = "api_settings";
     private final SharedPreferences prefs;
 
@@ -42,6 +47,22 @@ public final class ApiSettings {
 
     public void setServiceTier(String serviceTier) {
         prefs.edit().putString("service_tier", normalizeServiceTier(serviceTier)).apply();
+    }
+
+    /** Reasoning depth for Gemini 4 models. Medium is Google's default. */
+    public String thinkingLevel() {
+        return normalizeThinkingLevel(prefs.getString("thinking_level", THINKING_MEDIUM));
+    }
+
+    public void setThinkingLevel(String thinkingLevel) {
+        prefs.edit().putString("thinking_level", normalizeThinkingLevel(thinkingLevel)).apply();
+    }
+
+    static String normalizeThinkingLevel(String value) {
+        if (value == null) return THINKING_MEDIUM;
+        String clean = value.trim().toLowerCase(java.util.Locale.ROOT);
+        if (THINKING_LOW.equals(clean) || THINKING_HIGH.equals(clean)) return clean;
+        return THINKING_MEDIUM;
     }
 
     public String systemPrompt() {
