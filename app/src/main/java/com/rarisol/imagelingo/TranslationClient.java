@@ -64,6 +64,8 @@ public final class TranslationClient {
     private static final int DEFAULT_READ_TIMEOUT_MS = 90_000;
     /** Argon can reason for several minutes on a dense page. */
     private static final int ARGON_READ_TIMEOUT_MS = 10 * 60 * 1000;
+    /** Gemini 3.8 Flash on high thinking is slower than the old 90s budget allows. */
+    private static final int FLASH_38_READ_TIMEOUT_MS = 5 * 60 * 1000;
     private static final int MAX_RESPONSE_CHARACTERS = 2_000_000;
     private static final int MAX_TRANSLATION_BLOCKS = 200;
     private static final int MAX_BLOCK_TEXT_CHARACTERS = 2_000;
@@ -276,17 +278,28 @@ public final class TranslationClient {
         return id.startsWith("gemini-3") || id.startsWith("gemini-4");
     }
 
+    static boolean isFlash38Model(String model) {
+        return normalizeModelId(model).startsWith("gemini-3.8-flash");
+    }
+
+    /** Thinking tokens count against the cap, so thinking-level models get headroom. */
     static int maxOutputTokensFor(String model) {
-        return isArgonModel(model) ? ARGON_MAX_OUTPUT_TOKENS : MAX_OUTPUT_TOKENS;
+        return supportsThinkingLevel(model) ? ARGON_MAX_OUTPUT_TOKENS : MAX_OUTPUT_TOKENS;
     }
 
     static int readTimeoutFor(String model) {
-        return isArgonModel(model) ? ARGON_READ_TIMEOUT_MS : DEFAULT_READ_TIMEOUT_MS;
+        if (isArgonModel(model)) return ARGON_READ_TIMEOUT_MS;
+        if (isFlash38Model(model)) return FLASH_38_READ_TIMEOUT_MS;
+        return DEFAULT_READ_TIMEOUT_MS;
     }
 
-    /** Only Gemini 4 models take the low/medium/high thinking level from settings. */
+    /**
+     * Models that take the low/medium/high thinking level from settings: Gemini 4 and
+     * Gemini 3.8 Flash. Older models never receive thinkingConfig, so their requests are unchanged.
+     */
     static boolean supportsThinkingLevel(String model) {
-        return normalizeModelId(model).startsWith("gemini-4");
+        String id = normalizeModelId(model);
+        return id.startsWith("gemini-4") || isFlash38Model(id);
     }
 
     private static void putThinkingLevel(JSONObject config, String model, String thinkingLevel)

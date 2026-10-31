@@ -1549,8 +1549,8 @@ public final class MainActivity extends ComponentActivity {
                 : "서비스 계정 JSON이 암호화되어 저장되어 있습니다.");
         form.addView(vertexStatusText, matchWrap());
 
-        form.addView(section("추론 단계 · Gemini 4 Argon"));
-        form.addView(caption("Gemini API와 Vertex AI에서 gemini-4 모델을 쓸 때만 적용됩니다. 높을수록 정확도가 오를 수 있지만 느려지고 토큰 비용이 늘어납니다."),
+        form.addView(section("추론 단계 · Argon / 3.8 Flash"));
+        form.addView(caption("Gemini API와 Vertex AI에서 gemini-4-argon 또는 gemini-3.8-flash를 쓸 때만 적용됩니다. 높을수록 정확도가 오를 수 있지만 느려지고 토큰 비용이 늘어납니다."),
                 matchWrap());
         Spinner thinkingLevel = new Spinner(this);
         String[] thinkingLevelValues = {
@@ -1567,7 +1567,7 @@ public final class MainActivity extends ComponentActivity {
         for (int i = 0; i < thinkingLevelValues.length; i++) {
             if (thinkingLevelValues[i].equals(savedThinkingLevel)) thinkingLevel.setSelection(i);
         }
-        thinkingLevel.setContentDescription("Gemini 4 추론 단계");
+        thinkingLevel.setContentDescription("Gemini 추론 단계");
         thinkingLevel.setBackground(roundedBackground(0xFFF1F2F7, 12, 0xFFD5D8E2));
         thinkingLevel.setPadding(dp(12), 0, dp(8), 0);
         LinearLayout.LayoutParams thinkingParams = new LinearLayout.LayoutParams(
@@ -1837,7 +1837,7 @@ public final class MainActivity extends ComponentActivity {
         String provider = apiSettings.provider();
         String endpoint = ApiSettings.OPENAI.equals(provider) ? apiSettings.openAiEndpoint() : "";
         String serviceTier = ApiSettings.OPENAI.equals(provider) ? apiSettings.serviceTier() : "";
-        // Only Gemini 4 requests carry a thinking level, so other models keep their old fingerprints.
+        // Only Gemini 4 / 3.8 Flash requests carry a thinking level, so other models keep their old fingerprints.
         if (!ApiSettings.OPENAI.equals(provider) && TranslationClient.supportsThinkingLevel(activeModel())) {
             serviceTier = "thinking:" + apiSettings.thinkingLevel();
         }
