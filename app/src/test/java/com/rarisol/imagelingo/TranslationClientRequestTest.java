@@ -70,10 +70,10 @@ public final class TranslationClientRequestTest {
         assertTrue(config.has("responseFormat"));
         assertFalse(config.has("responseMimeType"));
         assertEquals(32_768, config.getInt("maxOutputTokens"));
-        assertEquals(8192, TranslationClient.buildVertexGenerationConfig("gemini-3.7-flash")
+        assertEquals(8192, TranslationClient.buildVertexGenerationConfig("gemini-2.5-flash")
                 .getInt("maxOutputTokens"));
         assertTrue(TranslationClient.readTimeoutFor("publishers/google/models/gemini-4-argon")
-                > TranslationClient.readTimeoutFor("gemini-3.7-flash"));
+                > TranslationClient.readTimeoutFor("gemini-2.5-flash"));
     }
 
     @Test public void argonSendsChosenThinkingLevelOnBothApis() throws Exception {
@@ -93,7 +93,7 @@ public final class TranslationClientRequestTest {
         assertEquals("low", TranslationClient.buildGeminiGenerationConfig("models/gemini-3.8-flash", "low")
                 .getJSONObject("thinkingConfig").getString("thinkingLevel"));
         assertTrue(TranslationClient.readTimeoutFor("gemini-3.8-flash")
-                > TranslationClient.readTimeoutFor("gemini-3.7-flash"));
+                > TranslationClient.readTimeoutFor("gemini-2.5-flash"));
     }
 
     @Test public void geminiEndpointUsesOfficialHostOrReverseProxy() throws Exception {
@@ -117,7 +117,9 @@ public final class TranslationClientRequestTest {
         assertEquals("priority", TranslationClient.geminiTierValue("models/gemini-3.8-flash", "priority"));
         assertEquals(null, TranslationClient.geminiTierValue("gemini-3.8-flash", "STANDARD"));
         assertEquals(null, TranslationClient.geminiTierValue("gemini-4-argon", "FLEX"));
-        assertEquals(null, TranslationClient.geminiTierValue("gemini-3.7-flash", "PRIORITY"));
+        assertEquals(null, TranslationClient.geminiTierValue("gemini-2.5-flash", "PRIORITY"));
+        assertEquals("priority", TranslationClient.geminiTierValue("gemini-3.7-flash", "PRIORITY"));
+        assertEquals("flex", TranslationClient.geminiTierValue("gemini-3.6-flash", "FLEX"));
         assertTrue(TranslationClient.readTimeoutFor("gemini-3.8-flash", "FLEX") >= 10 * 60 * 1000);
         assertEquals(TranslationClient.readTimeoutFor("gemini-3.8-flash"),
                 TranslationClient.readTimeoutFor("gemini-3.8-flash", "PRIORITY"));
@@ -131,8 +133,34 @@ public final class TranslationClientRequestTest {
         assertTrue(error.getMessage().contains("global"));
     }
 
+    @Test public void flash36And37TakeThinkingLevelsAndOnly36KeepsMinimal() throws Exception {
+        assertEquals("minimal", TranslationClient.buildGeminiGenerationConfig("gemini-3.6-flash", "minimal")
+                .getJSONObject("thinkingConfig").getString("thinkingLevel"));
+        assertEquals("high", TranslationClient.buildVertexGenerationConfig("gemini-3.7-flash", "high")
+                .getJSONObject("thinkingConfig").getString("thinkingLevel"));
+        // Argon / 3.7 / 3.8 reject minimal, so it is sent as low.
+        assertEquals("low", TranslationClient.buildVertexGenerationConfig("gemini-3.8-flash", "minimal")
+                .getJSONObject("thinkingConfig").getString("thinkingLevel"));
+        assertEquals("low", TranslationClient.buildGeminiGenerationConfig("gemini-4-argon", "minimal")
+                .getJSONObject("thinkingConfig").getString("thinkingLevel"));
+        assertEquals(32_768, TranslationClient.buildVertexGenerationConfig("gemini-3.6-flash", "low")
+                .getInt("maxOutputTokens"));
+    }
+
+    @Test public void thinkingFingerprintKeepsOldResultsForLegacyMediumOnly() {
+        // 3.6 / 3.7 used to send no thinking setting (= medium): existing results stay current.
+        assertEquals("", TranslationClient.thinkingFingerprint("gemini-3.7-flash", "medium"));
+        assertEquals("", TranslationClient.thinkingFingerprint("gemini-3.6-flash", "medium"));
+        assertEquals("thinking:high", TranslationClient.thinkingFingerprint("gemini-3.7-flash", "high"));
+        assertEquals("thinking:minimal", TranslationClient.thinkingFingerprint("gemini-3.6-flash", "minimal"));
+        // 3.8 / Argon already recorded medium explicitly; minimal is stored as what is sent (low).
+        assertEquals("thinking:medium", TranslationClient.thinkingFingerprint("gemini-3.8-flash", "medium"));
+        assertEquals("thinking:low", TranslationClient.thinkingFingerprint("gemini-4-argon", "minimal"));
+        assertEquals("", TranslationClient.thinkingFingerprint("gemini-2.5-flash", "high"));
+    }
+
     @Test public void olderModelsNeverGetThinkingConfig() throws Exception {
-        assertFalse(TranslationClient.buildVertexGenerationConfig("gemini-3.7-flash", "high")
+        assertFalse(TranslationClient.buildVertexGenerationConfig("gemini-3.5-flash-lite", "high")
                 .has("thinkingConfig"));
         assertFalse(TranslationClient.buildGeminiGenerationConfig("gemini-2.5-flash", "low")
                 .has("thinkingConfig"));
