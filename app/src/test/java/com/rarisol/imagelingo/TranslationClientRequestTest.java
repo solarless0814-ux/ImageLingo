@@ -96,6 +96,41 @@ public final class TranslationClientRequestTest {
                 > TranslationClient.readTimeoutFor("gemini-3.7-flash"));
     }
 
+    @Test public void geminiEndpointUsesOfficialHostOrReverseProxy() throws Exception {
+        assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent",
+                TranslationClient.geminiEndpoint("", "gemini-3.8-flash"));
+        assertEquals("https://p.example/google/v1beta/models/gemini-3.8-flash:generateContent",
+                TranslationClient.geminiEndpoint("https://p.example/google/", "gemini-3.8-flash"));
+        assertEquals("https://p.example/proxy/v1beta/models/gemini-3.8-flash:generateContent",
+                TranslationClient.geminiEndpoint("https://p.example/proxy/v1beta", "gemini-3.8-flash"));
+        assertEquals("https://p.example/v1/models/gemini-3.8-flash:generateContent",
+                TranslationClient.geminiEndpoint("https://p.example/v1/models", "gemini-3.8-flash"));
+        assertThrows(IllegalArgumentException.class,
+                () -> TranslationClient.geminiEndpoint("http://p.example", "gemini-3.8-flash"));
+        assertThrows(IllegalArgumentException.class,
+                () -> TranslationClient.geminiEndpoint("https://p.example/?key=x", "gemini-3.8-flash"));
+        assertFalse(TranslationClient.usesGeminiProxy("  "));
+    }
+
+    @Test public void flexAndPriorityApplyOnlyToFlash38() {
+        assertEquals("flex", TranslationClient.geminiTierValue("gemini-3.8-flash", "FLEX"));
+        assertEquals("priority", TranslationClient.geminiTierValue("models/gemini-3.8-flash", "priority"));
+        assertEquals(null, TranslationClient.geminiTierValue("gemini-3.8-flash", "STANDARD"));
+        assertEquals(null, TranslationClient.geminiTierValue("gemini-4-argon", "FLEX"));
+        assertEquals(null, TranslationClient.geminiTierValue("gemini-3.7-flash", "PRIORITY"));
+        assertTrue(TranslationClient.readTimeoutFor("gemini-3.8-flash", "FLEX") >= 10 * 60 * 1000);
+        assertEquals(TranslationClient.readTimeoutFor("gemini-3.8-flash"),
+                TranslationClient.readTimeoutFor("gemini-3.8-flash", "PRIORITY"));
+    }
+
+    @Test public void vertexFlexOrPriorityRequiresGlobal() {
+        TranslationClient.validateVertexTierLocation("gemini-3.8-flash", "FLEX", "global");
+        TranslationClient.validateVertexTierLocation("gemini-3.8-flash", "STANDARD", "us");
+        IllegalArgumentException error = assertThrows(IllegalArgumentException.class,
+                () -> TranslationClient.validateVertexTierLocation("gemini-3.8-flash", "PRIORITY", "eu"));
+        assertTrue(error.getMessage().contains("global"));
+    }
+
     @Test public void olderModelsNeverGetThinkingConfig() throws Exception {
         assertFalse(TranslationClient.buildVertexGenerationConfig("gemini-3.7-flash", "high")
                 .has("thinkingConfig"));
