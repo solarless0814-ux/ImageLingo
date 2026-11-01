@@ -86,6 +86,25 @@ public final class ApiSettings {
         return GEMINI_TIER_STANDARD;
     }
 
+    public static final int MAX_CONCURRENT_REQUESTS = 3;
+
+    /**
+     * How many pages are sent to the API at the same time during folder translation.
+     * 1 keeps strict page-by-page context; 3 is fastest but pages started together
+     * cannot see each other's names/terms.
+     */
+    public int concurrentRequests() {
+        return clampConcurrentRequests(prefs.getInt("concurrent_requests", MAX_CONCURRENT_REQUESTS));
+    }
+
+    public void setConcurrentRequests(int count) {
+        prefs.edit().putInt("concurrent_requests", clampConcurrentRequests(count)).apply();
+    }
+
+    static int clampConcurrentRequests(int count) {
+        return Math.max(1, Math.min(MAX_CONCURRENT_REQUESTS, count));
+    }
+
     /** Optional reverse-proxy base URL that replaces generativelanguage.googleapis.com. Empty = official. */
     public String geminiProxyUrl() {
         return prefs.getString("gemini_proxy_url", "");

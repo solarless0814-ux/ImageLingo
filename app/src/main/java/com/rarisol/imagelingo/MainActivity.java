@@ -1077,8 +1077,24 @@ public final class MainActivity extends ComponentActivity {
         tokenBadge.bringToFront();
     }
 
+    /** True when this page will need an API call (not already current, not served from cache). */
+    private boolean pageNeedsApiCall(ImageRepository.ImageEntry entry, Map<String, String> outputNames,
+                                     Map<String, Uri> knownOutputs, TranslationManifest manifest,
+                                     boolean forceOverwrite) {
+        String outputName = outputNames.get(entry.uri.toString());
+        Uri existing = knownOutputs.get(outputName);
+        if (!forceOverwrite && existing != null
+                && manifest.isCurrent(entry, outputName, outputFingerprint(entry))) {
+            return false;
+        }
+        if (forceOverwrite) return true;
+        TranslationClient.TranslationResult cached = translationCache.get(cacheKeyFor(entry));
+        return cached == null || cached.blocks.isEmpty();
+    }
+
     private void runFolderTranslation(List<ImageRepository.ImageEntry> snapshot, Uri treeUri,
                                       String pinnedUri, boolean forceOverwrite) {
+        PageRequestPipeline<TranslationClient.TranslationResult> prefetcher = null;
         int successCount = 0;
         int failureCount = 0;
         int cacheCount = 0;
@@ -1101,6 +1117,19 @@ public final class MainActivity extends ComponentActivity {
             Map<String, Uri> knownOutputs = ImageRepository.listImageDocumentsByName(
                     getContentResolver(), outputDir);
             Map<String, String> outputNames = outputNamesFor(snapshot);
+            // Up to N pages are requested at once; each request captures the context memory as it
+            // is when that request starts. Saving and memory updates below stay in page order.
+            final int totalPages = snapshot.size();
+            prefetcher = new PageRequestPipeline<TranslationClient.TranslationResult>(
+                    apiSettings.concurrentRequests(), totalPages,
+                    index -> pageNeedsApiCall(snapshot.get(index), outputNames, knownOutputs,
+                            manifest, forceOverwrite),
+                    index -> {
+                        ImageRepository.ImageEntry page = snapshot.get(index);
+                        String context = memory.buildContextPrompt();
+                        return () -> translateWithRateLimitRecovery(page, context, index + 1, totalPages);
+                    },
+                    () -> batchStopRequested);
             for (int i = 0; i < snapshot.size(); i++) {
                 if (batchStopRequested) {
                     stopped = true;
@@ -1122,11 +1151,13 @@ public final class MainActivity extends ComponentActivity {
                     }
                 });
                 try {
+                    prefetcher.topUp(displayIndex);
                     String outputName = outputNames.get(entry.uri.toString());
                     Uri existingOutput = knownOutputs.get(outputName);
                     String fingerprint = outputFingerprint(entry);
                     if (!forceOverwrite && existingOutput != null
                             && manifest.isCurrent(entry, outputName, fingerprint)) {
+                        prefetcher.discard(displayIndex);
                         translatedOutputMap.put(entry.uri.toString(), existingOutput);
                         String restoredText = manifest.resultText(entry, fingerprint);
                         if (!restoredText.isEmpty()) {
@@ -1152,14 +1183,13 @@ public final class MainActivity extends ComponentActivity {
                         continue;
                     }
 
-                    String continuityContext = memory.buildContextPrompt();
                     String key = cacheKeyFor(entry);
                     TranslationClient.TranslationResult result = forceOverwrite
                             ? null : translationCache.get(key);
                     if (result == null || result.blocks.isEmpty()) {
-                        result = translateWithRateLimitRecovery(
-                                entry, continuityContext, displayIndex + 1, snapshot.size());
+                        result = prefetcher.take(displayIndex);
                     } else {
+                        prefetcher.discard(displayIndex);
                         cacheCount++;
                     }
                     translationCache.put(key, result);
@@ -1372,6 +1402,9 @@ public final class MainActivity extends ComponentActivity {
                 showResult(errorTitle, errorMessage, true);
                 tokenBadge.setVisibility(View.GONE);
             });
+        } finally {
+            // Stops requests started ahead for pages the batch will not reach (stop, fatal error).
+            if (prefetcher != null) prefetcher.shutdown();
         }
     }
 
@@ -1608,6 +1641,26 @@ public final class MainActivity extends ComponentActivity {
         thinkingParams.setMargins(0, dp(4), 0, dp(4));
         form.addView(thinkingLevel, thinkingParams);
 
+        form.addView(section("번역 속도 · 동시 요청"));
+        form.addView(caption("폴더 번역 때 여러 페이지를 한꺼번에 API로 보냅니다. 3장이면 가장 빠르지만, 같이 보낸 페이지끼리는 서로의 이름·용어를 문맥으로 못 받고 분당 요청 한도(429)에 더 빨리 닿습니다. 저장 순서는 그대로입니다."),
+                matchWrap());
+        Spinner concurrency = new Spinner(this);
+        String[] concurrencyNames = {
+                "1장씩 · 문맥 일관성 최우선",
+                "2장 동시",
+                "3장 동시 · 가장 빠름"
+        };
+        concurrency.setAdapter(new ArrayAdapter<>(this,
+                android.R.layout.simple_spinner_dropdown_item, concurrencyNames));
+        concurrency.setSelection(apiSettings.concurrentRequests() - 1);
+        concurrency.setContentDescription("동시 요청 페이지 수");
+        concurrency.setBackground(roundedBackground(0xFFF1F2F7, 12, 0xFFD5D8E2));
+        concurrency.setPadding(dp(12), 0, dp(8), 0);
+        LinearLayout.LayoutParams concurrencyParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(52));
+        concurrencyParams.setMargins(0, dp(4), 0, dp(4));
+        form.addView(concurrency, concurrencyParams);
+
         form.addView(section("저장된 인증 정보"));
         form.addView(caption("OpenAI·Gemini API 키와 Vertex 서비스 계정 JSON을 이 기기에서 모두 삭제합니다."),
                 matchWrap());
@@ -1710,6 +1763,7 @@ public final class MainActivity extends ComponentActivity {
                 apiSettings.setGeminiServiceTier(geminiTierIndex >= 0 && geminiTierIndex < geminiTierValues.length
                         ? geminiTierValues[geminiTierIndex] : ApiSettings.GEMINI_TIER_STANDARD);
                 apiSettings.setGeminiProxyUrl(proxyValue);
+                apiSettings.setConcurrentRequests(concurrency.getSelectedItemPosition() + 1);
                 translationCache.clear();
                 if (batchRunning && rateLimitPaused) {
                     tokenBadge.setText("설정 저장 완료 · 계속하기를 누르면 같은 페이지부터 재시도합니다.");
