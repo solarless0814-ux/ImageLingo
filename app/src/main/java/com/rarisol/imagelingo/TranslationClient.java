@@ -66,6 +66,10 @@ public final class TranslationClient {
     private static final int ARGON_READ_TIMEOUT_MS = 10 * 60 * 1000;
     /** Gemini 3.8 Flash on high thinking is slower than the old 90s budget allows. */
     private static final int FLASH_38_READ_TIMEOUT_MS = 5 * 60 * 1000;
+    /** Flex targets 1-15 minutes; Google recommends client timeouts of at least 10 minutes. */
+    private static final int FLEX_READ_TIMEOUT_MS = 15 * 60 * 1000;
+    private static final String OFFICIAL_GEMINI_BASE = "https://generativelanguage.googleapis.com";
+    static final String VERTEX_SHARED_REQUEST_TYPE_HEADER = "X-Vertex-AI-LLM-Shared-Request-Type";
     private static final int MAX_RESPONSE_CHARACTERS = 2_000_000;
     private static final int MAX_TRANSLATION_BLOCKS = 200;
     private static final int MAX_BLOCK_TEXT_CHARACTERS = 2_000;
@@ -111,11 +115,13 @@ public final class TranslationClient {
                     throw new IllegalArgumentException("Vertex AI 리전 형식이 올바르지 않습니다.");
                 }
                 validateVertexModelLocation(vertexModel, location);
+                validateVertexTierLocation(vertexModel, settings.geminiServiceTier(), location);
                 break;
             case ApiSettings.GEMINI:
             default:
                 require(secrets.get("gemini_key"), "Gemini API 키가 설정되지 않았습니다.");
                 require(settings.geminiModel(), "Gemini 모델명이 비어 있습니다.");
+                geminiEndpoint(settings.geminiProxyUrl(), normalizeModelId(settings.geminiModel()));
                 break;
         }
     }
@@ -293,6 +299,60 @@ public final class TranslationClient {
         return DEFAULT_READ_TIMEOUT_MS;
     }
 
+    static int readTimeoutFor(String model, String geminiTier) {
+        int base = readTimeoutFor(model);
+        if ("flex".equals(geminiTierValue(model, geminiTier))) return Math.max(base, FLEX_READ_TIMEOUT_MS);
+        return base;
+    }
+
+    /** Flex / Priority is offered for Gemini 3.8 Flash only; other models stay on Standard. */
+    static boolean supportsGeminiServiceTier(String model) {
+        return isFlash38Model(model);
+    }
+
+    /** "flex" / "priority" when it applies to this model, otherwise null (Standard: send nothing). */
+    static String geminiTierValue(String model, String tier) {
+        if (!supportsGeminiServiceTier(model)) return null;
+        String clean = ApiSettings.normalizeGeminiServiceTier(tier);
+        if (ApiSettings.GEMINI_TIER_FLEX.equals(clean)) return "flex";
+        if (ApiSettings.GEMINI_TIER_PRIORITY.equals(clean)) return "priority";
+        return null;
+    }
+
+    /** Vertex Flex / Priority PayGo is served only from the global endpoint. */
+    static void validateVertexTierLocation(String model, String tier, String location) {
+        String value = geminiTierValue(model, tier);
+        if (value != null && !"global".equals(normalizeVertexLocation(location))) {
+            throw new IllegalArgumentException("Vertex AI의 " + (value.equals("flex") ? "Flex" : "Priority")
+                    + " 티어는 global 리전에서만 쓸 수 있습니다. 리전을 global로 바꾸거나 Standard를 선택하세요.");
+        }
+    }
+
+    /**
+     * Builds the generateContent URL. An empty proxy uses Google's official host. A reverse-proxy
+     * base may end at its root ("https://p.example/google") or at a version ("…/v1beta").
+     */
+    static String geminiEndpoint(String proxyBase, String model) throws Exception {
+        String base = proxyBase == null ? "" : proxyBase.trim();
+        if (base.isEmpty()) base = OFFICIAL_GEMINI_BASE;
+        URL url = NetworkPolicy.requireHttps(base);
+        if (url.getQuery() != null) {
+            throw new IllegalArgumentException("프록시 URL에 ?로 시작하는 쿼리를 넣을 수 없습니다. 키는 Gemini API 키 칸에 넣으세요.");
+        }
+        while (base.endsWith("/")) base = base.substring(0, base.length() - 1);
+        String lower = base.toLowerCase(Locale.ROOT);
+        if (lower.endsWith("/models")) {
+            base = base.substring(0, base.length() - "/models".length());
+            lower = base.toLowerCase(Locale.ROOT);
+        }
+        boolean hasVersion = lower.matches(".*/v1(alpha|beta)?\\d*$");
+        return base + (hasVersion ? "" : "/v1beta") + "/models/" + urlPath(model) + ":generateContent";
+    }
+
+    static boolean usesGeminiProxy(String proxyBase) {
+        return proxyBase != null && !proxyBase.trim().isEmpty();
+    }
+
     /**
      * Models that take the low/medium/high thinking level from settings: Gemini 4 and
      * Gemini 3.8 Flash. Older models never receive thinkingConfig, so their requests are unchanged.
@@ -430,8 +490,9 @@ public final class TranslationClient {
         require(apiKey, "Gemini API 키가 설정되지 않았습니다.");
         require(settings.geminiModel(), "Gemini 모델명이 비어 있습니다.");
         String model = normalizeModelId(settings.geminiModel());
-        String endpoint = "https://generativelanguage.googleapis.com/v1beta/models/"
-                + urlPath(model) + ":generateContent";
+        String proxyBase = settings.geminiProxyUrl();
+        String endpoint = geminiEndpoint(proxyBase, model);
+        String tierValue = geminiTierValue(model, settings.geminiServiceTier());
 
         JSONObject inline = new JSONObject()
                 .put("mime_type", image.mimeType)
@@ -446,9 +507,13 @@ public final class TranslationClient {
                 .put("system_instruction", systemInstruction)
                 .put("contents", new JSONArray().put(new JSONObject().put("role", "user").put("parts", parts)))
                 .put("generationConfig", generationConfig);
+        if (tierValue != null) body.put("service_tier", tierValue);
         Map<String, String> headers = new HashMap<>();
         headers.put("x-goog-api-key", apiKey.trim());
-        JSONObject response = postJson(endpoint, body, headers, retryListener, readTimeoutFor(model));
+        // Reverse proxies differ: some read x-goog-api-key, others a Bearer token. Never sent to Google.
+        if (usesGeminiProxy(proxyBase)) headers.put("Authorization", "Bearer " + apiKey.trim());
+        JSONObject response = postJson(endpoint, body, headers, retryListener,
+                readTimeoutFor(model, settings.geminiServiceTier()));
         return parseGeminiResult(response, "Gemini");
     }
 
@@ -471,6 +536,8 @@ public final class TranslationClient {
             throw new IllegalArgumentException("Vertex AI 리전 형식이 올바르지 않습니다.");
         }
         validateVertexModelLocation(model, location);
+        validateVertexTierLocation(model, settings.geminiServiceTier(), location);
+        String tierValue = geminiTierValue(model, settings.geminiServiceTier());
         String token = getAccessToken(clientEmail, privateKey, tokenUri);
         String host = vertexEndpointHost(location);
         String endpoint = "https://" + host + "/v1/projects/" + urlPath(project)
@@ -491,7 +558,8 @@ public final class TranslationClient {
                 .put("generationConfig", buildVertexGenerationConfig(model, settings.thinkingLevel()));
         Map<String, String> headers = new HashMap<>();
         headers.put("Authorization", "Bearer " + token);
-        int readTimeoutMs = readTimeoutFor(model);
+        if (tierValue != null) headers.put(VERTEX_SHARED_REQUEST_TYPE_HEADER, tierValue);
+        int readTimeoutMs = readTimeoutFor(model, settings.geminiServiceTier());
         JSONObject response;
         try {
             try {
@@ -811,7 +879,8 @@ public final class TranslationClient {
 
             if (code >= 200 && code < 300) return new JSONObject(responseText);
             String errorMessage = extractError(responseText);
-            if (code != 429 || !retryRateLimit) {
+            // 503 = Google at capacity (Flex has no automatic fallback); back off like a 429.
+            if ((code != 429 && code != 503) || !retryRateLimit) {
                 throw new HttpStatusException(code, errorMessage);
             }
             if (isNonRecoverableQuotaError(errorMessage + " " + responseText)) {

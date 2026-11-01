@@ -18,6 +18,11 @@ public final class ApiSettings {
     public static final String THINKING_MEDIUM = "medium";
     public static final String THINKING_HIGH = "high";
 
+    /** Gemini API / Vertex AI processing tiers (Gemini 3.8 Flash). */
+    public static final String GEMINI_TIER_STANDARD = "STANDARD";
+    public static final String GEMINI_TIER_FLEX = "FLEX";
+    public static final String GEMINI_TIER_PRIORITY = "PRIORITY";
+
     private static final String PREFS = "api_settings";
     private final SharedPreferences prefs;
 
@@ -63,6 +68,31 @@ public final class ApiSettings {
         String clean = value.trim().toLowerCase(java.util.Locale.ROOT);
         if (THINKING_LOW.equals(clean) || THINKING_HIGH.equals(clean)) return clean;
         return THINKING_MEDIUM;
+    }
+
+    /** Standard, Flex or Priority for Gemini 3.8 Flash on the Gemini API and Vertex AI. */
+    public String geminiServiceTier() {
+        return normalizeGeminiServiceTier(prefs.getString("gemini_service_tier", GEMINI_TIER_STANDARD));
+    }
+
+    public void setGeminiServiceTier(String tier) {
+        prefs.edit().putString("gemini_service_tier", normalizeGeminiServiceTier(tier)).apply();
+    }
+
+    static String normalizeGeminiServiceTier(String value) {
+        if (value == null) return GEMINI_TIER_STANDARD;
+        String clean = value.trim().toUpperCase(java.util.Locale.ROOT);
+        if (GEMINI_TIER_FLEX.equals(clean) || GEMINI_TIER_PRIORITY.equals(clean)) return clean;
+        return GEMINI_TIER_STANDARD;
+    }
+
+    /** Optional reverse-proxy base URL that replaces generativelanguage.googleapis.com. Empty = official. */
+    public String geminiProxyUrl() {
+        return prefs.getString("gemini_proxy_url", "");
+    }
+
+    public void setGeminiProxyUrl(String url) {
+        prefs.edit().putString("gemini_proxy_url", url == null ? "" : url.trim()).apply();
     }
 
     public String systemPrompt() {
