@@ -1029,11 +1029,11 @@ public final class MainActivity extends ComponentActivity {
             translateButton.setEnabled(true);
             translateButton.setText("계속하기");
             translateButton.setAlpha(1f);
-            tokenBadge.setText("429 자동 재시도 한도 도달 · 일시정지\n"
+            tokenBadge.setText("429/503 자동 재시도 한도 도달 · 일시정지\n"
                     + pageNumber + "/" + totalPages + "페이지 · 설정/한도 확인 후 계속하기");
             tokenBadge.setVisibility(View.VISIBLE);
             tokenBadge.bringToFront();
-            Toast.makeText(this, "429 제한으로 일시정지했습니다. 한도를 확인한 뒤 계속하기를 누르세요.",
+            Toast.makeText(this, "요청 제한(429) 또는 혼잡(503)으로 일시정지했습니다. 한도를 확인한 뒤 계속하기를 누르세요.",
                     Toast.LENGTH_LONG).show();
         });
 
@@ -1068,7 +1068,7 @@ public final class MainActivity extends ComponentActivity {
         String clean = message == null ? "" : message.trim();
         if (clean.length() > 80) clean = clean.substring(0, 80) + "…";
         StringBuilder value = new StringBuilder();
-        value.append("429 제한 · ").append(remainingSeconds).append("초 후 자동 재시도")
+        value.append("429/503 · ").append(remainingSeconds).append("초 후 자동 재시도")
                 .append(" (").append(attempt).append("/").append(maxRetries).append(")")
                 .append("\n").append(pageNumber).append("/").append(totalPages).append("페이지");
         if (!clean.isEmpty()) value.append(" · ").append(clean);
@@ -1077,8 +1077,24 @@ public final class MainActivity extends ComponentActivity {
         tokenBadge.bringToFront();
     }
 
+    /** True when this page will need an API call (not already current, not served from cache). */
+    private boolean pageNeedsApiCall(ImageRepository.ImageEntry entry, Map<String, String> outputNames,
+                                     Map<String, Uri> knownOutputs, TranslationManifest manifest,
+                                     boolean forceOverwrite) {
+        String outputName = outputNames.get(entry.uri.toString());
+        Uri existing = knownOutputs.get(outputName);
+        if (!forceOverwrite && existing != null
+                && manifest.isCurrent(entry, outputName, outputFingerprint(entry))) {
+            return false;
+        }
+        if (forceOverwrite) return true;
+        TranslationClient.TranslationResult cached = translationCache.get(cacheKeyFor(entry));
+        return cached == null || cached.blocks.isEmpty();
+    }
+
     private void runFolderTranslation(List<ImageRepository.ImageEntry> snapshot, Uri treeUri,
                                       String pinnedUri, boolean forceOverwrite) {
+        PageRequestPipeline<TranslationClient.TranslationResult> prefetcher = null;
         int successCount = 0;
         int failureCount = 0;
         int cacheCount = 0;
@@ -1101,6 +1117,19 @@ public final class MainActivity extends ComponentActivity {
             Map<String, Uri> knownOutputs = ImageRepository.listImageDocumentsByName(
                     getContentResolver(), outputDir);
             Map<String, String> outputNames = outputNamesFor(snapshot);
+            // Up to N pages are requested at once; each request captures the context memory as it
+            // is when that request starts. Saving and memory updates below stay in page order.
+            final int totalPages = snapshot.size();
+            prefetcher = new PageRequestPipeline<TranslationClient.TranslationResult>(
+                    apiSettings.concurrentRequests(), totalPages,
+                    index -> pageNeedsApiCall(snapshot.get(index), outputNames, knownOutputs,
+                            manifest, forceOverwrite),
+                    index -> {
+                        ImageRepository.ImageEntry page = snapshot.get(index);
+                        String context = memory.buildContextPrompt();
+                        return () -> translateWithRateLimitRecovery(page, context, index + 1, totalPages);
+                    },
+                    () -> batchStopRequested);
             for (int i = 0; i < snapshot.size(); i++) {
                 if (batchStopRequested) {
                     stopped = true;
@@ -1122,11 +1151,13 @@ public final class MainActivity extends ComponentActivity {
                     }
                 });
                 try {
+                    prefetcher.topUp(displayIndex);
                     String outputName = outputNames.get(entry.uri.toString());
                     Uri existingOutput = knownOutputs.get(outputName);
                     String fingerprint = outputFingerprint(entry);
                     if (!forceOverwrite && existingOutput != null
                             && manifest.isCurrent(entry, outputName, fingerprint)) {
+                        prefetcher.discard(displayIndex);
                         translatedOutputMap.put(entry.uri.toString(), existingOutput);
                         String restoredText = manifest.resultText(entry, fingerprint);
                         if (!restoredText.isEmpty()) {
@@ -1152,14 +1183,13 @@ public final class MainActivity extends ComponentActivity {
                         continue;
                     }
 
-                    String continuityContext = memory.buildContextPrompt();
                     String key = cacheKeyFor(entry);
                     TranslationClient.TranslationResult result = forceOverwrite
                             ? null : translationCache.get(key);
                     if (result == null || result.blocks.isEmpty()) {
-                        result = translateWithRateLimitRecovery(
-                                entry, continuityContext, displayIndex + 1, snapshot.size());
+                        result = prefetcher.take(displayIndex);
                     } else {
+                        prefetcher.discard(displayIndex);
                         cacheCount++;
                     }
                     translationCache.put(key, result);
@@ -1372,6 +1402,9 @@ public final class MainActivity extends ComponentActivity {
                 showResult(errorTitle, errorMessage, true);
                 tokenBadge.setVisibility(View.GONE);
             });
+        } finally {
+            // Stops requests started ahead for pages the batch will not reach (stop, fatal error).
+            if (prefetcher != null) prefetcher.shutdown();
         }
     }
 
@@ -1531,8 +1564,41 @@ public final class MainActivity extends ComponentActivity {
         form.addView(section("Gemini API"));
         EditText geminiKey = secretField("API 키 · AIza…", secureStore.get("gemini_key"));
         EditText geminiModel = field("모델명", apiSettings.geminiModel());
+        EditText geminiProxy = field("리버스 프록시 URL · 비우면 공식 Google 주소", apiSettings.geminiProxyUrl());
+        geminiProxy.setContentDescription("Gemini 리버스 프록시 URL");
         form.addView(geminiKey, fieldParams());
         form.addView(geminiModel, fieldParams());
+        form.addView(geminiProxy, fieldParams());
+        form.addView(caption("프록시를 쓰면 요청이 그 주소로 갑니다. 예: https://내프록시/google → /v1beta/models/모델:generateContent를 자동으로 붙입니다. "
+                        + "프록시 비밀번호나 키는 위 API 키 칸에 넣으세요. 프록시 운영자는 이미지·프롬프트·키를 볼 수 있으니 신뢰하는 HTTPS 주소만 쓰세요."),
+                matchWrap());
+
+        form.addView(section("Gemini 처리 티어 · 3.8 Flash"));
+        form.addView(caption("gemini-3.8-flash에만 적용됩니다(Gemini API·Vertex AI). Flex는 비용이 절반이지만 응답에 몇 분 걸릴 수 있고, 혼잡하면 자동으로 다시 시도합니다. "
+                        + "Priority는 더 빠르고 비싸며(Gemini API는 결제 Tier 2 이상), 여유가 없으면 Standard로 처리됩니다. Vertex AI에서 Flex·Priority는 global 리전만 됩니다."),
+                matchWrap());
+        Spinner geminiTier = new Spinner(this);
+        String[] geminiTierValues = {
+                ApiSettings.GEMINI_TIER_STANDARD, ApiSettings.GEMINI_TIER_FLEX, ApiSettings.GEMINI_TIER_PRIORITY
+        };
+        String[] geminiTierNames = {
+                "Standard · 기본",
+                "Flex · 50% 저렴 · 느림",
+                "Priority · 빠름 · 비쌈"
+        };
+        geminiTier.setAdapter(new ArrayAdapter<>(this,
+                android.R.layout.simple_spinner_dropdown_item, geminiTierNames));
+        String savedGeminiTier = apiSettings.geminiServiceTier();
+        for (int i = 0; i < geminiTierValues.length; i++) {
+            if (geminiTierValues[i].equals(savedGeminiTier)) geminiTier.setSelection(i);
+        }
+        geminiTier.setContentDescription("Gemini 3.8 Flash 처리 티어");
+        geminiTier.setBackground(roundedBackground(0xFFF1F2F7, 12, 0xFFD5D8E2));
+        geminiTier.setPadding(dp(12), 0, dp(8), 0);
+        LinearLayout.LayoutParams geminiTierParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(52));
+        geminiTierParams.setMargins(0, dp(4), 0, dp(4));
+        form.addView(geminiTier, geminiTierParams);
 
         form.addView(section("Vertex AI"));
         EditText vertexModel = field("모델명", apiSettings.vertexModel());
@@ -1549,8 +1615,8 @@ public final class MainActivity extends ComponentActivity {
                 : "서비스 계정 JSON이 암호화되어 저장되어 있습니다.");
         form.addView(vertexStatusText, matchWrap());
 
-        form.addView(section("추론 단계 · Gemini 4 Argon"));
-        form.addView(caption("Gemini API와 Vertex AI에서 gemini-4 모델을 쓸 때만 적용됩니다. 높을수록 정확도가 오를 수 있지만 느려지고 토큰 비용이 늘어납니다."),
+        form.addView(section("추론 단계 · Argon / 3.8 Flash"));
+        form.addView(caption("Gemini API와 Vertex AI에서 gemini-4-argon 또는 gemini-3.8-flash를 쓸 때만 적용됩니다. 높을수록 정확도가 오를 수 있지만 느려지고 토큰 비용이 늘어납니다."),
                 matchWrap());
         Spinner thinkingLevel = new Spinner(this);
         String[] thinkingLevelValues = {
@@ -1567,13 +1633,33 @@ public final class MainActivity extends ComponentActivity {
         for (int i = 0; i < thinkingLevelValues.length; i++) {
             if (thinkingLevelValues[i].equals(savedThinkingLevel)) thinkingLevel.setSelection(i);
         }
-        thinkingLevel.setContentDescription("Gemini 4 추론 단계");
+        thinkingLevel.setContentDescription("Gemini 추론 단계");
         thinkingLevel.setBackground(roundedBackground(0xFFF1F2F7, 12, 0xFFD5D8E2));
         thinkingLevel.setPadding(dp(12), 0, dp(8), 0);
         LinearLayout.LayoutParams thinkingParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(52));
         thinkingParams.setMargins(0, dp(4), 0, dp(4));
         form.addView(thinkingLevel, thinkingParams);
+
+        form.addView(section("번역 속도 · 동시 요청"));
+        form.addView(caption("폴더 번역 때 여러 페이지를 한꺼번에 API로 보냅니다. 3장이면 가장 빠르지만, 같이 보낸 페이지끼리는 서로의 이름·용어를 문맥으로 못 받고 분당 요청 한도(429)에 더 빨리 닿습니다. 저장 순서는 그대로입니다."),
+                matchWrap());
+        Spinner concurrency = new Spinner(this);
+        String[] concurrencyNames = {
+                "1장씩 · 문맥 일관성 최우선",
+                "2장 동시",
+                "3장 동시 · 가장 빠름"
+        };
+        concurrency.setAdapter(new ArrayAdapter<>(this,
+                android.R.layout.simple_spinner_dropdown_item, concurrencyNames));
+        concurrency.setSelection(apiSettings.concurrentRequests() - 1);
+        concurrency.setContentDescription("동시 요청 페이지 수");
+        concurrency.setBackground(roundedBackground(0xFFF1F2F7, 12, 0xFFD5D8E2));
+        concurrency.setPadding(dp(12), 0, dp(8), 0);
+        LinearLayout.LayoutParams concurrencyParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(52));
+        concurrencyParams.setMargins(0, dp(4), 0, dp(4));
+        form.addView(concurrency, concurrencyParams);
 
         form.addView(section("저장된 인증 정보"));
         form.addView(caption("OpenAI·Gemini API 키와 Vertex 서비스 계정 JSON을 이 기기에서 모두 삭제합니다."),
@@ -1621,6 +1707,7 @@ public final class MainActivity extends ComponentActivity {
                 .setPositiveButton("저장", null)
                 .create();
         final String[] confirmedCustomEndpoint = {null};
+        final String[] confirmedGeminiProxy = {apiSettings.geminiProxyUrl().trim()};
         dialog.setOnShowListener(ignored -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
             try {
                 String providerValue = provider.getSelectedItemPosition() == 1 ? ApiSettings.OPENAI
@@ -1642,6 +1729,24 @@ public final class MainActivity extends ComponentActivity {
                         return;
                     }
                 }
+                String proxyValue = geminiProxy.getText().toString().trim();
+                if (!proxyValue.isEmpty()) {
+                    // Rejects http://, ?query and malformed URLs before anything is saved.
+                    TranslationClient.geminiEndpoint(proxyValue, "gemini-3.8-flash");
+                    if (!proxyValue.equals(confirmedGeminiProxy[0])) {
+                        String proxyHost = NetworkPolicy.requireHttps(proxyValue).getHost();
+                        new AlertDialog.Builder(this)
+                                .setTitle("Gemini 프록시 확인")
+                                .setMessage(proxyHost + " 호스트로 Gemini API 키, 이미지, 프롬프트와 폴더 문맥을 전송합니다. 이 프록시를 신뢰할 때만 계속하세요.")
+                                .setNegativeButton("취소", null)
+                                .setPositiveButton("신뢰하고 저장", (warning, which) -> {
+                                    confirmedGeminiProxy[0] = proxyValue;
+                                    dialog.getButton(AlertDialog.BUTTON_POSITIVE).performClick();
+                                })
+                                .show();
+                        return;
+                    }
+                }
                 secureStore.put("openai_key", openAiKey.getText().toString().trim());
                 secureStore.put("gemini_key", geminiKey.getText().toString().trim());
                 apiSettings.save(providerValue,
@@ -1654,6 +1759,11 @@ public final class MainActivity extends ComponentActivity {
                 int thinkingIndex = thinkingLevel.getSelectedItemPosition();
                 apiSettings.setThinkingLevel(thinkingIndex >= 0 && thinkingIndex < thinkingLevelValues.length
                         ? thinkingLevelValues[thinkingIndex] : ApiSettings.THINKING_MEDIUM);
+                int geminiTierIndex = geminiTier.getSelectedItemPosition();
+                apiSettings.setGeminiServiceTier(geminiTierIndex >= 0 && geminiTierIndex < geminiTierValues.length
+                        ? geminiTierValues[geminiTierIndex] : ApiSettings.GEMINI_TIER_STANDARD);
+                apiSettings.setGeminiProxyUrl(proxyValue);
+                apiSettings.setConcurrentRequests(concurrency.getSelectedItemPosition() + 1);
                 translationCache.clear();
                 if (batchRunning && rateLimitPaused) {
                     tokenBadge.setText("설정 저장 완료 · 계속하기를 누르면 같은 페이지부터 재시도합니다.");
@@ -1825,8 +1935,11 @@ public final class MainActivity extends ComponentActivity {
         }
         String thinking = TranslationClient.supportsThinkingLevel(activeModel())
                 ? " · 추론 " + apiSettings.thinkingLevel() : "";
-        if (ApiSettings.VERTEX.equals(apiSettings.provider())) return "Vertex AI" + thinking;
-        return "Gemini" + thinking;
+        String tierValue = TranslationClient.geminiTierValue(activeModel(), apiSettings.geminiServiceTier());
+        String tier = tierValue == null ? "" : ("flex".equals(tierValue) ? " · Flex" : " · Priority");
+        if (ApiSettings.VERTEX.equals(apiSettings.provider())) return "Vertex AI" + tier + thinking;
+        String proxy = TranslationClient.usesGeminiProxy(apiSettings.geminiProxyUrl()) ? " · 프록시" : "";
+        return "Gemini" + proxy + tier + thinking;
     }
 
     private String cacheKeyFor(ImageRepository.ImageEntry entry) {
@@ -1837,7 +1950,7 @@ public final class MainActivity extends ComponentActivity {
         String provider = apiSettings.provider();
         String endpoint = ApiSettings.OPENAI.equals(provider) ? apiSettings.openAiEndpoint() : "";
         String serviceTier = ApiSettings.OPENAI.equals(provider) ? apiSettings.serviceTier() : "";
-        // Only Gemini 4 requests carry a thinking level, so other models keep their old fingerprints.
+        // Only Gemini 4 / 3.8 Flash requests carry a thinking level, so other models keep their old fingerprints.
         if (!ApiSettings.OPENAI.equals(provider) && TranslationClient.supportsThinkingLevel(activeModel())) {
             serviceTier = "thinking:" + apiSettings.thinkingLevel();
         }
