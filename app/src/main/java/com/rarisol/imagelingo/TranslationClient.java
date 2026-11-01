@@ -284,8 +284,49 @@ public final class TranslationClient {
         return id.startsWith("gemini-3") || id.startsWith("gemini-4");
     }
 
-    static boolean isFlash38Model(String model) {
-        return normalizeModelId(model).startsWith("gemini-3.8-flash");
+    /**
+     * Gemini 3.6 / 3.7 / 3.8 Flash. All take the low/medium/high thinking level (3.6 also minimal)
+     * and the Flex/Priority tiers. 3.7 is deprecated and Google routes its requests to 3.8.
+     */
+    static boolean isModernFlashModel(String model) {
+        String id = normalizeModelId(model);
+        return id.startsWith("gemini-3.8-flash") || isFlash37Model(id) || isFlash36Model(id);
+    }
+
+    static boolean isFlash36Model(String model) {
+        return normalizeModelId(model).startsWith("gemini-3.6-flash");
+    }
+
+    /** Only 3.6 Flash accepts "minimal"; Argon, 3.7 and 3.8 reject it with an error. */
+    static boolean supportsMinimalThinking(String model) {
+        return isFlash36Model(model);
+    }
+
+    /** The level actually sent: minimal falls back to low on models that reject it. */
+    static String effectiveThinkingLevel(String model, String thinkingLevel) {
+        String level = ApiSettings.normalizeThinkingLevel(thinkingLevel);
+        if (ApiSettings.THINKING_MINIMAL.equals(level) && !supportsMinimalThinking(model)) {
+            return ApiSettings.THINKING_LOW;
+        }
+        return level;
+    }
+
+    static boolean isFlash37Model(String model) {
+        return normalizeModelId(model).startsWith("gemini-3.7-flash");
+    }
+
+    /**
+     * Part of a page's output fingerprint that reflects the thinking level. Changing the level
+     * marks earlier results stale. 3.6 / 3.7 Flash requests used to carry no thinking setting (Google's
+     * default, medium), so medium keeps their existing fingerprints and avoids paid re-translation.
+     */
+    static String thinkingFingerprint(String model, String thinkingLevel) {
+        if (!supportsThinkingLevel(model)) return "";
+        String level = effectiveThinkingLevel(model, thinkingLevel);
+        // 3.6 / 3.7 requests used to carry no thinking setting, i.e. Google's default (medium).
+        if ((isFlash37Model(model) || isFlash36Model(model))
+                && ApiSettings.THINKING_MEDIUM.equals(level)) return "";
+        return "thinking:" + level;
     }
 
     /** Thinking tokens count against the cap, so thinking-level models get headroom. */
@@ -295,7 +336,7 @@ public final class TranslationClient {
 
     static int readTimeoutFor(String model) {
         if (isArgonModel(model)) return ARGON_READ_TIMEOUT_MS;
-        if (isFlash38Model(model)) return FLASH_38_READ_TIMEOUT_MS;
+        if (isModernFlashModel(model)) return FLASH_38_READ_TIMEOUT_MS;
         return DEFAULT_READ_TIMEOUT_MS;
     }
 
@@ -305,9 +346,9 @@ public final class TranslationClient {
         return base;
     }
 
-    /** Flex / Priority is offered for Gemini 3.8 Flash only; other models stay on Standard. */
+    /** Flex / Priority is offered for Gemini 3.6 / 3.7 / 3.8 Flash; other models stay on Standard. */
     static boolean supportsGeminiServiceTier(String model) {
-        return isFlash38Model(model);
+        return isModernFlashModel(model);
     }
 
     /** "flex" / "priority" when it applies to this model, otherwise null (Standard: send nothing). */
@@ -355,18 +396,18 @@ public final class TranslationClient {
 
     /**
      * Models that take the low/medium/high thinking level from settings: Gemini 4 and
-     * Gemini 3.8 Flash. Older models never receive thinkingConfig, so their requests are unchanged.
+     * Gemini 3.6 / 3.7 / 3.8 Flash. Older models never receive thinkingConfig, so their requests are unchanged.
      */
     static boolean supportsThinkingLevel(String model) {
         String id = normalizeModelId(model);
-        return id.startsWith("gemini-4") || isFlash38Model(id);
+        return id.startsWith("gemini-4") || isModernFlashModel(id);
     }
 
     private static void putThinkingLevel(JSONObject config, String model, String thinkingLevel)
             throws Exception {
         if (thinkingLevel == null || !supportsThinkingLevel(model)) return;
         config.put("thinkingConfig", new JSONObject()
-                .put("thinkingLevel", ApiSettings.normalizeThinkingLevel(thinkingLevel)));
+                .put("thinkingLevel", effectiveThinkingLevel(model, thinkingLevel)));
     }
 
     static JSONObject buildGeminiGenerationConfig(String model) throws Exception {

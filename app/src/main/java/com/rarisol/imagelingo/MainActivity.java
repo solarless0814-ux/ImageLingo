@@ -1,11 +1,13 @@
 package com.rarisol.imagelingo;
 
+import android.Manifest;
 import android.app.AlertDialog;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.UriPermission;
+import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
 import android.content.res.Configuration;
 import android.graphics.Bitmap;
@@ -15,6 +17,7 @@ import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.text.InputType;
 import android.util.Size;
@@ -113,6 +116,8 @@ public final class MainActivity extends ComponentActivity {
     private Uri currentTreeUri;
     private volatile boolean batchRunning;
     private volatile boolean batchStopRequested;
+    /** True between onStart and onStop; decides whether a "finished" notification is useful. */
+    private volatile boolean activityVisible;
     private volatile String processingImageUri;
     private volatile int processingPageNumber;
     private volatile TranslationMemory translationMemory;
@@ -969,8 +974,40 @@ public final class MainActivity extends ComponentActivity {
                 ? images.get(currentIndex).uri.toString()
                 : allImages.get(0).uri.toString();
         updateTopProgress(0);
+        // Foreground service + notification so the batch keeps its network and CPU when the
+        // user leaves the app or turns the screen off.
+        requestNotificationPermissionIfNeeded();
+        TranslationService.cancelFinished(this);
+        TranslationService.start(this, "폴더 번역 준비 중 · " + snapshot.size() + "장");
         batchTask = batchExecutor.submit(
                 () -> runFolderTranslation(snapshot, treeUri, pinnedUri, forceOverwrite));
+    }
+
+    private static final int REQUEST_NOTIFICATIONS = 4101;
+
+    /** Android 13+: ask once so the progress notification is visible (translation runs either way). */
+    private void requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return;
+        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) {
+            return;
+        }
+        if (appPrefs.getBoolean("notification_permission_asked", false)
+                && !shouldShowRequestPermissionRationale(Manifest.permission.POST_NOTIFICATIONS)) {
+            return;
+        }
+        appPrefs.edit().putBoolean("notification_permission_asked", true).apply();
+        requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQUEST_NOTIFICATIONS);
+    }
+
+    @Override protected void onStart() {
+        super.onStart();
+        activityVisible = true;
+        TranslationService.cancelFinished(this);
+    }
+
+    @Override protected void onStop() {
+        activityVisible = false;
+        super.onStop();
     }
 
     private void requestStopBatch() {
@@ -1031,6 +1068,8 @@ public final class MainActivity extends ComponentActivity {
             translateButton.setAlpha(1f);
             tokenBadge.setText("429/503 자동 재시도 한도 도달 · 일시정지\n"
                     + pageNumber + "/" + totalPages + "페이지 · 설정/한도 확인 후 계속하기");
+            TranslationService.updateProgress(this, pageNumber - 1, totalPages,
+                    "요청 제한으로 일시정지 · 앱을 열어 계속하기를 누르세요");
             tokenBadge.setVisibility(View.VISIBLE);
             tokenBadge.bringToFront();
             Toast.makeText(this, "요청 제한(429) 또는 혼잡(503)으로 일시정지했습니다. 한도를 확인한 뒤 계속하기를 누르세요.",
@@ -1377,6 +1416,12 @@ public final class MainActivity extends ComponentActivity {
                 Toast.makeText(this,
                         finalStopped ? "번역을 중지했습니다." : "폴더 번역이 완료되었습니다.",
                         Toast.LENGTH_LONG).show();
+                if (!activityVisible) {
+                    TranslationService.notifyFinished(this,
+                            finalStopped ? "폴더 번역 중지됨" : "폴더 번역 완료",
+                            "새로 번역 " + finalSuccessCount + "장 · 건너뜀 " + finalSkippedCount
+                                    + "장 · 실패 " + finalFailureCount + "장");
+                }
             });
         } catch (Exception e) {
             String errorTitle;
@@ -1401,6 +1446,9 @@ public final class MainActivity extends ComponentActivity {
                 updateTopProgress(0);
                 showResult(errorTitle, errorMessage, true);
                 tokenBadge.setVisibility(View.GONE);
+                if (!activityVisible) {
+                    TranslationService.notifyFinished(this, errorTitle, errorMessage);
+                }
             });
         } finally {
             // Stops requests started ahead for pages the batch will not reach (stop, fatal error).
@@ -1417,6 +1465,7 @@ public final class MainActivity extends ComponentActivity {
     private void finishBatchUi() {
         batchRunning = false;
         batchStopRequested = false;
+        TranslationService.stop(this);
         synchronized (rateLimitPauseLock) {
             rateLimitPaused = false;
             rateLimitPauseMessage = "";
@@ -1463,6 +1512,11 @@ public final class MainActivity extends ComponentActivity {
         tokenBadge.setText(text.toString());
         tokenBadge.setVisibility(View.VISIBLE);
         tokenBadge.bringToFront();
+        if (batchRunning) {
+            String summary = completed + "/" + total + " · 저장 " + successCount
+                    + (failureCount > 0 ? " · 실패 " + failureCount : "");
+            TranslationService.updateProgress(this, completed, total, summary);
+        }
     }
 
     private void showResult(String title, String text, boolean error) {
@@ -1573,8 +1627,8 @@ public final class MainActivity extends ComponentActivity {
                         + "프록시 비밀번호나 키는 위 API 키 칸에 넣으세요. 프록시 운영자는 이미지·프롬프트·키를 볼 수 있으니 신뢰하는 HTTPS 주소만 쓰세요."),
                 matchWrap());
 
-        form.addView(section("Gemini 처리 티어 · 3.8 Flash"));
-        form.addView(caption("gemini-3.8-flash에만 적용됩니다(Gemini API·Vertex AI). Flex는 비용이 절반이지만 응답에 몇 분 걸릴 수 있고, 혼잡하면 자동으로 다시 시도합니다. "
+        form.addView(section("Gemini 처리 티어 · 3.6 / 3.7 / 3.8 Flash"));
+        form.addView(caption("gemini-3.6-flash, gemini-3.7-flash, gemini-3.8-flash에만 적용됩니다(Gemini API·Vertex AI). Flex는 비용이 절반이지만 응답에 몇 분 걸릴 수 있고, 혼잡하면 자동으로 다시 시도합니다. "
                         + "Priority는 더 빠르고 비싸며(Gemini API는 결제 Tier 2 이상), 여유가 없으면 Standard로 처리됩니다. Vertex AI에서 Flex·Priority는 global 리전만 됩니다."),
                 matchWrap());
         Spinner geminiTier = new Spinner(this);
@@ -1592,7 +1646,7 @@ public final class MainActivity extends ComponentActivity {
         for (int i = 0; i < geminiTierValues.length; i++) {
             if (geminiTierValues[i].equals(savedGeminiTier)) geminiTier.setSelection(i);
         }
-        geminiTier.setContentDescription("Gemini 3.8 Flash 처리 티어");
+        geminiTier.setContentDescription("Gemini 3.6·3.7·3.8 Flash 처리 티어");
         geminiTier.setBackground(roundedBackground(0xFFF1F2F7, 12, 0xFFD5D8E2));
         geminiTier.setPadding(dp(12), 0, dp(8), 0);
         LinearLayout.LayoutParams geminiTierParams = new LinearLayout.LayoutParams(
@@ -1615,14 +1669,16 @@ public final class MainActivity extends ComponentActivity {
                 : "서비스 계정 JSON이 암호화되어 저장되어 있습니다.");
         form.addView(vertexStatusText, matchWrap());
 
-        form.addView(section("추론 단계 · Argon / 3.8 Flash"));
-        form.addView(caption("Gemini API와 Vertex AI에서 gemini-4-argon 또는 gemini-3.8-flash를 쓸 때만 적용됩니다. 높을수록 정확도가 오를 수 있지만 느려지고 토큰 비용이 늘어납니다."),
+        form.addView(section("추론 단계 · Argon / 3.6 / 3.7 / 3.8 Flash"));
+        form.addView(caption("Gemini API와 Vertex AI에서 gemini-4-argon, gemini-3.6/3.7/3.8-flash를 쓸 때만 적용됩니다. 높을수록 정확도가 오를 수 있지만 느려지고 토큰 비용이 늘어납니다. Minimal은 3.6 Flash만 지원해서, 다른 모델에서는 Low로 보냅니다."),
                 matchWrap());
         Spinner thinkingLevel = new Spinner(this);
         String[] thinkingLevelValues = {
-                ApiSettings.THINKING_LOW, ApiSettings.THINKING_MEDIUM, ApiSettings.THINKING_HIGH
+                ApiSettings.THINKING_MINIMAL, ApiSettings.THINKING_LOW,
+                ApiSettings.THINKING_MEDIUM, ApiSettings.THINKING_HIGH
         };
         String[] thinkingLevelNames = {
+                "Minimal · 가장 빠름 · 3.6 Flash 전용",
                 "Low · 빠르고 저렴",
                 "Medium · 기본값",
                 "High · 깊게 추론 · 느림"
@@ -1934,7 +1990,8 @@ public final class MainActivity extends ComponentActivity {
             return "OpenAI · " + (apiSettings.usesFlexTier() ? "Flex" : "Standard");
         }
         String thinking = TranslationClient.supportsThinkingLevel(activeModel())
-                ? " · 추론 " + apiSettings.thinkingLevel() : "";
+                ? " · 추론 " + TranslationClient.effectiveThinkingLevel(activeModel(), apiSettings.thinkingLevel())
+                : "";
         String tierValue = TranslationClient.geminiTierValue(activeModel(), apiSettings.geminiServiceTier());
         String tier = tierValue == null ? "" : ("flex".equals(tierValue) ? " · Flex" : " · Priority");
         if (ApiSettings.VERTEX.equals(apiSettings.provider())) return "Vertex AI" + tier + thinking;
@@ -1950,9 +2007,10 @@ public final class MainActivity extends ComponentActivity {
         String provider = apiSettings.provider();
         String endpoint = ApiSettings.OPENAI.equals(provider) ? apiSettings.openAiEndpoint() : "";
         String serviceTier = ApiSettings.OPENAI.equals(provider) ? apiSettings.serviceTier() : "";
-        // Only Gemini 4 / 3.8 Flash requests carry a thinking level, so other models keep their old fingerprints.
-        if (!ApiSettings.OPENAI.equals(provider) && TranslationClient.supportsThinkingLevel(activeModel())) {
-            serviceTier = "thinking:" + apiSettings.thinkingLevel();
+        // Only Gemini 4 / 3.6·3.7·3.8 Flash requests carry a thinking level, so other models keep their old fingerprints.
+        if (!ApiSettings.OPENAI.equals(provider)) {
+            String thinking = TranslationClient.thinkingFingerprint(activeModel(), apiSettings.thinkingLevel());
+            if (!thinking.isEmpty()) serviceTier = thinking;
         }
         String project = ApiSettings.VERTEX.equals(provider) ? apiSettings.vertexProject() : "";
         String location = ApiSettings.VERTEX.equals(provider) ? apiSettings.vertexLocation() : "";
@@ -2224,6 +2282,7 @@ public final class MainActivity extends ComponentActivity {
         folderLoadVersion.incrementAndGet();
         imageLoadVersion.incrementAndGet();
         batchStopRequested = true;
+        TranslationService.stop(this);
         synchronized (rateLimitPauseLock) {
             rateLimitPaused = false;
             rateLimitPauseLock.notifyAll();

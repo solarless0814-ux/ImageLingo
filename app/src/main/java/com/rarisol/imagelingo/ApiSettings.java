@@ -14,6 +14,8 @@ public final class ApiSettings {
     public static final String SERVICE_TIER_FLEX = "FLEX";
 
     /** Gemini 4 / 3.8 Flash thinking levels, sent as generationConfig.thinkingConfig.thinkingLevel. */
+    /** Only Gemini 3.6 Flash accepts minimal; other models are sent low instead. */
+    public static final String THINKING_MINIMAL = "minimal";
     public static final String THINKING_LOW = "low";
     public static final String THINKING_MEDIUM = "medium";
     public static final String THINKING_HIGH = "high";
@@ -66,7 +68,8 @@ public final class ApiSettings {
     static String normalizeThinkingLevel(String value) {
         if (value == null) return THINKING_MEDIUM;
         String clean = value.trim().toLowerCase(java.util.Locale.ROOT);
-        if (THINKING_LOW.equals(clean) || THINKING_HIGH.equals(clean)) return clean;
+        if (THINKING_MINIMAL.equals(clean) || THINKING_LOW.equals(clean)
+                || THINKING_HIGH.equals(clean)) return clean;
         return THINKING_MEDIUM;
     }
 
